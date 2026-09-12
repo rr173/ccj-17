@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+.venv/
+venv/
+__pycache__/
+
+# Build and test output
+dist/
+build/
+coverage/
+.pytest_cache/
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
+
+# Internal records, traces, launcher, and runtime
+训练记录.md
+执行脚本.sh
+*.xlsx
+traces/
+.private/
