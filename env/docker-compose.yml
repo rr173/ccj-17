@@ -1,0 +1,28 @@
+services:
+  appendlog:
+    build: .
+    image: append-only-log:latest
+    container_name: append-only-log
+    ports:
+      - "8080:8080"
+    volumes:
+      - logdata:/data
+    environment:
+      # 租约默认时长 / 上限
+      DEFAULT_TTL_MS: "30000"
+      MAX_TTL_MS: "86400000"
+      # 段滚动大小（演示环境可调小，如 65536）
+      SEGMENT_BYTES: "1048576"
+      # 后台自动压缩：至少多少个“可回收 sealed 段”才动手
+      COMPACTION_MIN_SEGMENTS: "4"
+      JANITOR_INTERVAL_MS: "5000"
+      JANITOR_ENABLED: "true"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  logdata:
