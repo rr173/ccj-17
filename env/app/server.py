@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .common import Error, canonical, err
 from .kernel import Config, Kernel
-from .replication import LeaseRefresher, Replicator
+from .replication import ClusterSupervisor, Replicator
 
 MAX_BODY = 4 * 1024 * 1024
 
@@ -60,6 +60,8 @@ def build_config() -> Config:
         replication_interval_ms=int(os.environ.get("REPLICATION_INTERVAL_MS", 500)),
         replication_batch=int(os.environ.get("REPLICATION_BATCH", 500)),
         replica_source=(os.environ.get("REPLICA_SOURCE", "").strip() or None),
+        commit_timeout_ms=int(os.environ.get("COMMIT_TIMEOUT_MS", 3_000)),
+        read_barrier_timeout_ms=int(os.environ.get("READ_BARRIER_TIMEOUT_MS", 3_000)),
     )
 
 
@@ -158,7 +160,11 @@ class Handler(BaseHTTPRequestHandler):
                 b = self._body()
                 if "type" not in b:
                     raise err(400, "bad_request", "append requires type")
-                return self._send(201, self.kernel.append(b["type"], b.get("payload")))
+                return self._send(201, self.kernel.append(
+                    b["type"], b.get("payload"),
+                    write_id=b.get("write_id"),
+                    timeout_ms=b.get("timeout_ms"),
+                    wait_commit=bool(b.get("wait", True))))
             if route == ("batches", 1, "POST"):
                 b = self._body()
                 return self._send(201, self.kernel.create_batch(b.get("idempotency_key"), b.get("ttl_ms")))
@@ -175,12 +181,25 @@ class Handler(BaseHTTPRequestHandler):
                     ops = [{"type": b["type"], "payload": b.get("payload")}]
                 return self._send(200, self.kernel.batch_add_ops(parts[1], ops))
             if len(parts) == 3 and parts[0] == "batches" and parts[2] == "commit" and method == "POST":
-                return self._send(200, self.kernel.commit_batch(parts[1]))
+                b = self._body()
+                return self._send(200, self.kernel.commit_batch(
+                    parts[1], write_id=b.get("write_id"),
+                    timeout_ms=b.get("timeout_ms"),
+                    wait_commit=bool(b.get("wait", True))))
             if len(parts) == 3 and parts[0] == "batches" and parts[2] == "abort" and method == "POST":
                 return self._send(200, self.kernel.abort_batch(parts[1]))
             if route == ("read", 1, "GET"):
                 start = self._qs_int("from", 1, minimum=1)
                 limit = min(self._qs_int("limit", 100, minimum=1), 1000)
+                consistency = self._qs().get("consistency", [""])[0]
+                if consistency == "linearizable":
+                    timeout = self._qs().get("timeout_ms", [None])[0]
+                    view = self.kernel.linearizable_read(
+                        None if timeout is None else int(timeout))
+                    # 线性一致读：返回提交水位内、从 start 起的事件 + 屏障状态
+                    recs = self.kernel.read(start, limit)
+                    view.update(recs)
+                    return self._send(200, view)
                 return self._send(200, self.kernel.read(start, limit))
             if route == ("readers", 1, "GET"):
                 from .common import now_ms
@@ -200,6 +219,11 @@ class Handler(BaseHTTPRequestHandler):
             if route == ("pins", 1, "GET"):
                 return self._send(200, self.kernel.pin_view())
             if route == ("state", 1, "GET"):
+                qs = self._qs()
+                if qs.get("consistency", [""])[0] == "linearizable":
+                    timeout = qs.get("timeout_ms", [None])[0]
+                    return self._send(200, self.kernel.linearizable_read(
+                        None if timeout is None else int(timeout)))
                 return self._send(200, self.kernel.business_state())
             if route == ("head", 1, "GET"):
                 return self._send(200, self.kernel.head_info())
@@ -240,6 +264,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, self.kernel.export_snapshot(gen, term))
             if len(parts) == 2 and parts[0] == "cluster" and parts[1] == "request_vote" and method == "POST":
                 return self._send(200, self.kernel.handle_request_vote(self._body()))
+            if len(parts) == 2 and parts[0] == "cluster" and parts[1] == "ack" and method == "POST":
+                b = self._body()
+                return self._send(200, self.kernel.handle_ack(
+                    str(b.get("node_id", "?")), int(b.get("term", 0)),
+                    int(b.get("match_seq", 0)), int(b.get("commit_seq", 0)),
+                    barrier=bool(b.get("barrier", False)),
+                    commit_digest=b.get("commit_digest")))
+            if len(parts) == 2 and parts[0] == "cluster" and parts[1] == "append_entries" and method == "POST":
+                return self._send(200, self.kernel.handle_append_entries(self._body()))
+            if len(parts) == 2 and parts[0] == "cluster" and parts[1] == "progress" and method == "GET":
+                return self._send(200, self.kernel.handle_progress())
             if len(parts) == 2 and parts[0] == "cluster" and parts[1] == "lease" and method == "POST":
                 term = int(self._qs().get("term", ["0"])[0] or 0)
                 return self._send(200, self.kernel.handle_lease_ack(term))
@@ -271,11 +306,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 _ENDPOINTS = [
-    "POST /append", "GET /read?from=1&limit=100",
+    "POST /append {type,payload,write_id?,timeout_ms?,wait?}",
+    "GET /read?from=1&limit=100&consistency=linearizable",
     "POST /batches", "GET /batches", "GET /batches/{id}",
-    "POST /batches/{id}/ops", "POST /batches/{id}/commit", "POST /batches/{id}/abort",
+    "POST /batches/{id}/ops",
+    "POST /batches/{id}/commit {write_id?,timeout_ms?,wait?}",
+    "POST /batches/{id}/abort",
     "GET /readers", "POST /readers[/{id}]", "POST /readers/{id}/heartbeat", "DELETE /readers/{id}",
-    "GET /pins", "GET /state", "GET /head",
+    "GET /pins", "GET /state?consistency=linearizable", "GET /head",
     "POST /compact", "GET /compact/result", "POST /compact/verify",
     "GET /audit", "GET /status", "GET /health",
     "GET /replica", "POST /replica {peer_url}", "POST /replica/cycle",
@@ -285,6 +323,7 @@ _ENDPOINTS = [
     "POST /cluster/promote {term?,ttl_ms?,voters?,required_seq?}",
     "POST /cluster/stepdown", "POST /cluster/grant {ttl_ms?}",
     "POST /cluster/request_vote", "POST /cluster/lease?term=",
+    "POST /cluster/ack {node_id,term,match_seq,commit_seq,barrier?}",
 ]
 
 
@@ -301,16 +340,13 @@ def main() -> None:
     if janitor:
         janitor.start()
         bg.append(janitor)
-    # 备库后台拉取；多节点主库授权续租心跳（拿不到多数派则不续期，
-    # TTL 过后写入被门控拒绝；发现更高任期则授权失效、线程退出）
-    if kernel.cluster.role == "standby":
-        rep = Replicator(kernel, cfg.replication_interval_ms)
-        rep.start()
-        bg.append(rep)
-    elif cfg.peers:
-        refresher = LeaseRefresher(kernel, cfg.lease_interval_ms, cfg.grant_ttl_ms)
-        refresher.start()
-        bg.append(refresher)
+    # 角色驱动的后台循环：备库拉取、多节点主授权续租与主动推送。
+    # 故障切换是运行时事件，监督线程按当前角色启停对应子循环，无需重启进程。
+    supervisor = ClusterSupervisor(
+        kernel, cfg.replication_interval_ms,
+        cfg.lease_interval_ms, cfg.grant_ttl_ms)
+    supervisor.start()
+    bg.append(supervisor)
     print(f"append-only log listening on {host}:{port}; "
           f"role={kernel.cluster.role} term={kernel.cluster.term} "
           f"recovery={json.dumps(recovery, ensure_ascii=False)}")

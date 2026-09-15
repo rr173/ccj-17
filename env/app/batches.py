@@ -53,6 +53,7 @@ class Batch:
     created_at: int = 0
     expires_at: int = 0
     committed_ts: Optional[int] = None
+    write_id: Optional[str] = None  # 多数派提交：整批共享的调用方写入标识
 
     def registry_key(self) -> str:
         """幂等登记键：调用方给的幂等键；未给则以批次 id 兜底（同批次重试仍幂等）。"""
@@ -77,6 +78,7 @@ class Batch:
             "created_at": self.created_at,
             "expires_at": self.expires_at,
             "committed_ts": self.committed_ts,
+            "write_id": self.write_id,
         }
 
 
@@ -121,11 +123,14 @@ class BatchStore:
         b.ops.extend({"type": op["type"], "payload": op.get("payload")} for op in ops)
         self.persist()
 
-    def mark_committing(self, b: Batch, first_seq: int, content_hash: str) -> None:
-        """提交意图落盘：崩溃恢复据此识别未完成的提交并回滚。"""
+    def mark_committing(self, b: Batch, first_seq: int, content_hash: str,
+                        write_id: Optional[str] = None) -> None:
+        """提交意图落盘：崩溃恢复据此识别未完成的提交并回滚/等待确认。"""
         b.status = COMMITTING
         b.first_seq = first_seq
         b.content_hash = content_hash
+        if write_id is not None:
+            b.write_id = write_id
         self.persist()
 
     def register_commit(self, key: str, entry: dict) -> None:

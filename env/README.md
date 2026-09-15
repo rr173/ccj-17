@@ -5,16 +5,24 @@
 写入支持 **带幂等键的原子批次**：分多次组装、整批提交、崩溃不留半批。
 支持 **主备复制与故障切换**：备实例从主实例建立复制（一致边界 + 顺序增量），
 提升使用单调递增任期与带有效期的授权，分叉历史被明确拒绝。
+写入采用 **多数派提交水位（commit watermark）**：主先本地持久化，再等待当前
+任期多数投票成员确认同一日志位置，只有越过提交水位的记录才对普通读取可见；
+支持 `write_id` 提交幂等与 `consistency=linearizable` 的读取屏障。
 
 * 零第三方依赖，仅 Python 3.11 标准库
 * 哈希链记录（防篡改），快照/清单自校验摘要 + 逐条段凭证 + 只追加审计链
 * 原子批次：提交前不可见、整批一次性可见、幂等键防重、崩溃只恢复成整批已提交/未提交
+* **多数派提交水位**：`commit_index` 持久化；`write_id` 重试继续同一提交，
+  超时返回 `commit_timeout`（任期/序号/write_id）；原子批次不被提交水位拆开
+* **线性一致读**：主在当前任期完成多数派读屏障后才返回状态；失去多数派、
+  授权过期或任期变化时明确拒绝；备实例拒绝并返回角色、任期、已知主
 * 读者登记、心跳续租、过期自动失效
 * 压缩双 Pass 校验 + 业务等价证明（完整重放 ≡ 快照 + 尾部重放）
 * 唯一提交点（原子指针替换），压缩中途崩溃/校验失败自动回到上一个完整边界
 * 压缩互斥（线程锁 + `flock`）：多个压缩任务只有一个能改变可见结果
 * 主备复制：一致快照边界原子安装、增量逐条摘要链校验、重复段不重复应用、
-  已确认位置分叉停在 conflict；故障切换任期单调、授权 TTL、每任期多数派单胜者
+  已确认位置分叉停在 conflict；主主动推送（故障切换后旧主无需改配即可追上）；
+  故障切换任期单调、授权 TTL、每任期多数派单胜者、只保留多数派可证前缀
 * 提供 Docker / docker-compose 部署
 
 ---
@@ -40,7 +48,8 @@
     ├── compact-result.json     # 最近一次压缩结果（成功/失败/跳过原因）
     ├── head.json               # 链头锚点 {seq, digest}：每次追加后原子更新
     ├── cluster.json            # 集群角色/单调任期/带 TTL 授权/每任期投票（重启有效）
-    └── replica.json            # 复制关系、已确认序号/摘要、来源边界、最近错误
+    ├── replica.json            # 复制关系、已确认序号/摘要、来源边界、最近错误
+    └── commit.json             # 多数派提交水位、待定提议、write_id 登记、成员确认位置
 ```
 
 ### 1.1 记录哈希链
@@ -119,7 +128,9 @@ GET  /batches                 -> 全部批次摘要
 
 **可见性**：未提交的批次只存在于 `state/batches.json`，普通读取（`/read`）
 与业务状态（`/state`）都看不到；提交时整批记录按加入顺序一次性入链
-（全程持元数据锁），读者要么看到整批、要么完全看不到。
+（全程持元数据锁），且提交水位只会在整批的 `last_seq` 推进——读者要么看到
+整批、要么完全看不到，批次绝不会落在提交水位两侧。多数派确认超时的批次保持
+`committing`（记录已在本地持久化），相同 `write_id` 重试继续同一序号区间。
 
 **幂等**（提交结果登记在 `batches.json` 的 `commits` 表，重启不失）：
 
@@ -148,6 +159,55 @@ GET  /batches                 -> 全部批次摘要
 | 第 3 步（提交点）后 | 整批已提交：启动时补记批次状态；恢复后的重复提交仍返回原幂等结果 |
 
 运行期追加失败（如磁盘错误）同样整批回滚，不留半批。
+
+---
+
+## 3.5 多数派提交水位与线性一致读
+
+普通写入（`POST /append`）与原子批次提交（`POST /batches/{id}/commit`）
+都遵循同一个多数派提交流程，且都接受调用方提供的 **`write_id`**：
+
+```
+1. 主先把记录持久化到本地日志（fsync + 链头锚点），登记 write_id 与待定提议；
+2. 主等待当前任期的多数投票成员确认「同一日志位置」（摘要一致）；
+3. 多数派确认后推进持久化的 commit_index，只有 <= commit_index 的记录可见。
+```
+
+* **`write_id` 幂等**：缺省自动生成。相同 `write_id` 的重试永远续用同一
+  任期与序号区间——已提交返回首次结果（`replay:true`）、等待中继续等待、
+  被新任期截断返回 `409 commit_superseded`。绝不追加重复记录或返回另一个序号。
+* **`commit_timeout`**：超时返回 `504 commit_timeout`，错误详情含
+  `term / write_id / first_seq / last_seq / commit_index`；记录仍是待定状态，
+  相同 `write_id` 重试继续同一提交过程。`timeout_ms`（默认 `COMMIT_TIMEOUT_MS`，
+  50..120000ms）可控制等待上限，`{"wait": false}` 只做本地持久化立即返回。
+* **原子批次不被水位拆开**：提交水位只在提议边界（普通写 / 整批 / 任期标记）
+  推进，一个批次永远整体可见或整体不可见。
+* **待定区间可查询**：`GET /replica`、`GET /status` 返回 `commit_index`、
+  `pending`（待定序号区间与提议明细）、`member_acks`（各成员确认位置）。
+  `GET /read` 与 `GET /state` 默认只返回不超过提交水位的内容（更高的读取
+  返回空页并标记 `ahead_of_commit`）。
+
+### 线性一致读
+
+`GET /state?consistency=linearizable`（或 `/read?...&consistency=linearizable`）
+触发一次 **读屏障（ReadIndex）**：当前主在**当前任期**向多数投票成员发心跳
+并得到确认后，才返回提交水位内的状态。
+
+* 联系不到多数派 -> `504 read_barrier_timeout`；
+* 等待期间发现更高任期/失去主身份 -> `409 term_changed`；
+* 授权过期 -> `403 grant_expired`；
+* 备实例 -> `403 not_primary`，详情给出当前 `role`、`term` 与已知主 `primary`。
+
+### 故障切换与旧任期尾部
+
+新主竞选时只保留**能由多数派证明的日志前缀**（投票响应携带 `attest_seq`），
+超出此前缀的旧主半提交尾部会被裁掉，不会暴露；已经返回成功的记录（曾被
+多数派确认）绝不回退、不重复。新主就任时先写入一条**当前任期标记**
+（内部 `data` 记录）：旧任期的待定尾部不能仅凭新主自己的副本变成已提交，
+必须等这条当前任期记录先被多数派确认后，才随提交水位一起确认（Raft 安全性）。
+故障切换后旧主不会自动改拉新主，新主会通过 `POST /cluster/append_entries`
+**主动推送**增量并回收确认；旧主本地若有分叉的未提交尾部，则停在 `conflict`
+等待显式处理，绝不静默覆盖已确认历史。
 
 ---
 
@@ -202,42 +262,46 @@ GET  /batches                 -> 全部批次摘要
 
 | 方法 路径 | 说明 |
 |---|---|
-| `POST /append` | `{type, payload}` → 返回 `{seq, prev, digest,...}` |
+| `POST /append` | `{type, payload, write_id?, timeout_ms?, wait?}` → 多数派确认后返回 `{seq, write_id, committed, commit_index,...}`；超时 `504 commit_timeout` |
 | `POST /batches` | 创建原子批次 `{idempotency_key?, ttl_ms?}` → `{batch_id, status:"open",...}` |
 | `POST /batches/{id}/ops` | 分次加入记录 `{ops:[{type,payload},...]}`（或单条 `{type,payload}`） |
-| `POST /batches/{id}/commit` | 提交批次：整批一次性可见；幂等重放返回首次结果 |
+| `POST /batches/{id}/commit` | 提交批次（可带 `write_id?/timeout_ms?/wait?`）：整批越提交水位一次性可见；幂等重放返回首次结果 |
 | `POST /batches/{id}/abort` | 放弃批次（之后不能再提交） |
 | `GET /batches/{id}` | 批次最终状态与日志序号范围 `first_seq..last_seq` |
 | `GET /batches` | 全部批次摘要 |
-| `GET /read?from=&limit=` | 读原始事件（压缩掉的序号 → `410 compacted`，附 `readable_from`） |
-| `GET /state` | **从头读取的业务含义**：快照状态+尾部重放，返回当前状态与摘要 |
+| `GET /read?from=&limit=[&consistency=linearizable]` | 读原始事件；默认只返回 `<= commit_index` 的记录（待定位置返回空页 `ahead_of_commit`）；压缩掉的序号 → `410 compacted` |
+| `GET /state[?consistency=linearizable]` | **从头读取的业务含义**：默认折叠到提交水位；线性一致读先做多数派读屏障 |
 | `GET /head` | 当前 checkpoint 与可读起点 `readable_from` |
 | `POST /readers[/{id}]` | 登记读者：`{pin_seq, ttl_ms?}`（id 可省略自动生成） |
 | `POST /readers/{id}/heartbeat` | `{ttl_ms?, position?}` 续租/推进游标 |
 | `DELETE /readers/{id}` | 释放钉位 |
 | `GET /readers` | 列出读者、剩余租约、是否存活 |
 | `GET /pins` | **最老钉住点、受保护段、可回收范围/字节数** |
-| `POST /compact` | 触发压缩；body `{"force":true}` 绕过段数阈值 |
+| `POST /compact` | 触发压缩（只回收已越提交水位的段）；body `{"force":true}` 绕过段数阈值 |
 | `GET /compact/result` | **最近一次压缩结果**（成功/失败阶段/等价证明/跳过原因） |
 | `POST /compact/verify` | 重新复核当前边界，返回逐项 checks |
 | `GET /audit` | 压缩审计链 |
-| `GET /replica` | **复制/集群总览**：phase（syncing/caught_up/conflict/grant_invalid/writable_primary）、角色、任期、授权、已同步序号、来源边界、延迟、最近错误 |
+| `GET /replica` | **复制/集群总览**：phase、角色、任期、授权、已同步序号、**`commit_index` 提交水位、`pending` 待定区间、`member_acks` 各成员确认位置**、来源边界、延迟、最近错误 |
 | `POST /replica` | 备实例指定来源 `{peer_url}`（须为 standby） |
-| `POST /replica/cycle` | 手动触发一次拉取周期（返回 applied/installed_snapshot/status） |
+| `POST /replica/cycle` | 手动触发一次拉取周期（返回 applied/installed_snapshot/commit_index/status） |
 | `POST /replica/stop` / `POST /replica/reset` | 停止跟随 / 冲突后人工重置（冲突不能自动恢复） |
-| `GET /replica/boundary` | （复制协议）主导出任期、tip 与当前 checkpoint 边界 |
-| `GET /replica/records?from=&limit=&term=` | （复制协议）导出增量记录（已压缩序号 → 410 snapshot_required） |
-| `GET /replica/snapshot?gen=&term=` | （复制协议）导出完整边界（snapshot+manifest+pointer） |
-| `POST /cluster/promote` | 备实例竞选提升：`{term?, ttl_ms?, voters?, required_seq?}` |
+| `GET /replica/boundary` | （复制协议）主导出任期、tip、提交水位与当前 checkpoint 边界 |
+| `GET /replica/records?from=&limit=&term=` | （复制协议）导出增量记录（含提交水位、待定提议、任期标记） |
+| `GET /replica/snapshot?gen=&term=` | （复制协议）导出完整边界（snapshot+manifest+pointer+提交水位） |
+| `POST /cluster/promote` | 备实例竞选提升：`{term?, ttl_ms?, voters?, required_seq?}`；只保留多数派可证前缀并写入任期标记 |
 | `POST /cluster/stepdown` | 当前主主动交接（授权立即失效、降为备） |
 | `POST /cluster/grant` | 授权续租 `{ttl_ms?}`（过期后不能续，必须重新竞选） |
-| `POST /cluster/request_vote` | （选举协议）候选拉票：每任期持久化最多一票 |
+| `POST /cluster/request_vote` | （选举协议）候选拉票：每任期持久化最多一票，回执含 `attest_seq` 可证位置 |
 | `POST /cluster/lease?term=` | （租约协议）主任期心跳；见更高任期的节点自动让位 |
-| `GET /status` | 总览：段、租约、钉位、checkpoint、压缩状态、cluster/replication |
+| `POST /cluster/ack` | （提交协议）成员上报确认位置 / 主读屏障心跳（`barrier:true`） |
+| `POST /cluster/append_entries` / `GET /cluster/progress` | （复制协议）主主动推送增量 / 备汇报同步进度（故障切换后旧主无需改配即可追上） |
+| `GET /status` | 总览：段、租约、钉位、checkpoint、压缩状态、提交水位、待定区间、cluster/replication |
 | `GET /health` | 健康检查 |
 
 错误统一为 `{"error","message","details"}`，语义化状态码
-（400 参数 / 404 / 409 冲突（幂等冲突、批次已放弃、压缩忙）/ 410 租约过期、批次过期或序号已压缩 / 413 / 500）。
+（400 参数 / 403 非主或授权过期 / 404 / 409 冲突（幂等冲突、批次已放弃、压缩忙、
+`commit_superseded`、`term_changed`）/ 410 租约过期、批次过期或序号已压缩 /
+413 / 500 / **504 `commit_timeout`、`read_barrier_timeout`**）。
 
 ### 快速试一下
 
@@ -346,6 +410,13 @@ POST /replica/cycle
   任期心跳），其旧任期写入被 `not_primary`/`grant_expired` 拒绝、
   旧任期复制数据被 `stale_term` 拒绝；授权过期或进程重启都不会让旧
   任期重新生效（cluster.json 落盘恢复）。
+* **只保留多数派可证前缀**：投票响应携带投票方可证明的位置 `attest_seq`，
+  新主就任时把日志裁到多数派共同持有前缀；旧主独占的半提交尾部被丢弃，
+  曾被多数派确认（返回过成功）的记录绝不回退、不重复。新主先写入当前任期
+  标记，旧任期待定记录必须等它随当前任期记录一起被多数派确认后才可见。
+* **主主动推送**：故障切换后旧主不会自动改拉新主，新主通过
+  `/cluster/progress` 探测成员位置并以 `/cluster/append_entries` 主动推送
+  增量（与拉取走同一套逐记录校验），确认位置随响应回收、计入多数派提交。
 
 ### 6.4 状态接口
 
@@ -360,7 +431,9 @@ POST /replica/cycle
 | `grant_invalid` | 主角色但授权过期/缺失，不可写，需要重新竞选 |
 
 同响应给出：角色、term、授权剩余毫秒、`synced_seq`/`synced_digest`、
-来源边界（term/tip/checkpoint）、`lag_ms`、`last_error`。
+来源边界（term/tip/checkpoint）、`lag_ms`、`last_error`，以及多数派
+提交视图 `commit_index`、`pending`（待定序号区间与提议明细：普通写 /
+原子批次 / 任期标记）与 `member_acks`（各成员当前确认位置）。
 
 ### 6.5 典型两节点切换（HTTP）
 
@@ -414,8 +487,10 @@ docker compose logs -f
 | `REPLICA_SOURCE` | 空 | 以 standby 首次引导时的来源主 URL（之后可 `POST /replica` 改） |
 | `GRANT_TTL_MS` | `10000` | 竞选成功获得的授权有效期（上限 5 分钟） |
 | `LEASE_INTERVAL_MS` | `2000` | 多节点主授权续租心跳间隔 |
-| `REPLICATION_INTERVAL_MS` | `500` | 备库拉取周期 |
+| `REPLICATION_INTERVAL_MS` | `500` | 备库拉取 / 主主动推送 / 角色监督周期 |
 | `REPLICATION_BATCH` | `500` | 单页增量记录上限 |
+| `COMMIT_TIMEOUT_MS` | `3000` | 写入等待多数派提交的默认超时（可被请求体 `timeout_ms` 覆盖，50..120000） |
+| `READ_BARRIER_TIMEOUT_MS` | `3000` | 线性一致读屏障的默认等待超时 |
 
 > 压缩期间持有元数据锁，会短暂阻塞追加（默认小段配置下为毫秒~亚秒级）。
 > 主备部署使用**各自独立的数据卷**；压缩互斥的 `flock` 针对同一数据目录，
@@ -451,6 +526,18 @@ HTTP 端到端（含 janitor 在钉位保护下不误删、释放后自动压缩
   同任期多数派单胜者、旧主旧任期写入/拉票/复制数据被拒、
   授权过期不可写不可续、重启不复活旧任期、备见到更高任期前滚
 * 真实 HTTP 双进程复制、交接、提升与备进程重启续传
+
+多数派提交与线性一致读（`tests/test_consensus.py`）：
+
+* 多数派正常确认推进 `commit_index`；少数派隔离返回 `commit_timeout`
+  （含任期/序号/write_id），记录保持待定且不暴露
+* 相同 `write_id` 重试继续同一提交：同一序号、不重复入链、忽略不同负载
+* 并发写入保持日志顺序；原子批次不会在提交水位两侧拆开
+* 主在本地持久化后崩溃：重启记录保持待定，相同 `write_id` 续用同一序号
+* 新主只保留多数派可证前缀并写入任期标记；旧任期待定尾部不能仅凭新主
+  副本提交；旧主半提交尾部冲突时冻结，已确认记录跨重启/切换不回退不重复
+* 线性一致读：多数派读屏障成功、失去多数派/任期变化/授权过期被拒、
+  备实例返回角色/任期/已知主；读与状态默认只暴露 `<= commit_index` 的内容
 
 `CRASH_HOOK={after_fold|after_write|after_verify|after_switch}`
 可让进程在压缩对应阶段 `os._exit(99)`；

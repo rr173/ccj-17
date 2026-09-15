@@ -44,18 +44,73 @@ def pair(tmp_path, grants=300_000, segment_bytes=10_000_000):
                     peers={"P": "local://P", "S": "local://S"},
                     source="local://P", grant_ttl=grants,
                     segment_bytes=segment_bytes)
-    return p, s, direct_transport({"local://P": p, "local://S": s})
+    t = direct_transport({"local://P": p, "local://S": s})
+    return p, s, Pump(p, s, t)
 
 
-def seed(p, n, start=0):
+class Pump:
+    """测试辅助：把主的待定写入经备复制推进到多数派提交。
+
+    多数派提交语义下，两节点集群的主写入必须等备确认。默认 seed() 等
+    便捷函数在每次主写入后跑一轮备复制并让主处理备的 ack，使写入立即
+    取得多数确认；需要精确控制复制时机的测试可 pause()/resume()。
+    """
+
+    def __init__(self, p, s, t):
+        self.p, self.s, self.t = p, s, t
+        self.enabled = True
+        self._paused = False
+
+    def cycle(self):
+        return self.s.run_replication_cycle(self.t)
+
+    def commit_pending(self, primary=None):
+        """跑备复制直到主的待定提议全部提交（有界等待）。"""
+        primary = primary or self.p
+        for _ in range(50):
+            self.s.run_replication_cycle(self.t)
+            if not primary.commit.pending:
+                return True
+        return False
+
+    def pause(self):
+        self._paused = True
+
+    def resume(self):
+        self._paused = False
+
+
+def seed(p, n, start=0, pump=None, commit=False):
+    """主写入 n 条。commit=True 且有 pump 时推动到多数派提交；
+    默认只在主本地持久化（待定），由测试显式跑复制周期来取得确认。
+    """
     for i in range(start, start + n):
-        p.append("put", {"key": f"k{i % 3}", "value": i})
+        wid = f"seed-{i}"
+        if not commit or pump is None:
+            p.append("put", {"key": f"k{i % 3}", "value": i},
+                     write_id=wid, wait_commit=False)
+            continue
+        try:
+            p.append("put", {"key": f"k{i % 3}", "value": i},
+                     write_id=wid, timeout_ms=200, transport=pump.t)
+        except Error as e:
+            assert e.code == "commit_timeout", e.code
+            pump.commit_pending(p)
+            # 相同 write_id 重试：继续同一提交过程，同一序号、不重复入链
+            p.append("put", {"key": f"k{i % 3}", "value": i},
+                     write_id=wid, timeout_ms=2000, transport=pump.t)
+
+
+def commit_seeds(p, n, start=0, pump=None):
+    """主写入并立即经备复制取得多数派确认（便捷封装）。"""
+    seed(p, n, start=start, pump=pump, commit=True)
 
 
 class TestBasicReplication:
     def test_initial_sync_and_incremental(self, tmp_path):
-        p, s, t = pair(tmp_path)
-        seed(p, 5)
+        p, s, pump = pair(tmp_path)
+        t = pump.t
+        seed(p, 5, pump=pump)
         r = s.run_replication_cycle(t)
         assert r["applied"] == 5 and r["status"] == "caught_up"
         v = s.replication_view()
@@ -64,14 +119,15 @@ class TestBasicReplication:
         assert v["replication"]["source_boundary"]["tip_seq"] == 5
         assert v["tip_digest"] == p.seglog.tip()[1]
         # 增量
-        seed(p, 3, start=5)
+        seed(p, 3, start=5, pump=pump)
         r = s.run_replication_cycle(t)
         assert r["applied"] == 3 and r["status"] == "caught_up"
         assert p.business_state()["state"] == s.business_state()["state"]
 
     def test_status_fields(self, tmp_path):
-        p, s, t = pair(tmp_path)
-        seed(p, 2)
+        p, s, pump = pair(tmp_path)
+        t = pump.t
+        seed(p, 2, pump=pump)
         s.run_replication_cycle(t)
         rep = s.replication_view()
         assert rep["cluster"]["role"] == "standby"
@@ -83,8 +139,9 @@ class TestBasicReplication:
         assert pview["cluster"]["grant_valid"] is True
 
     def test_standby_rejects_writes(self, tmp_path):
-        p, s, t = pair(tmp_path)
-        seed(p, 1)
+        p, s, pump = pair(tmp_path)
+        t = pump.t
+        seed(p, 1, pump=pump)
         s.run_replication_cycle(t)
         with pytest.raises(Error) as e:
             s.append("put", {"key": "x", "value": 1})
@@ -95,15 +152,16 @@ class TestBasicReplication:
             s.compact()
 
     def test_resume_from_confirmed_position_and_duplicate_apply(self, tmp_path):
-        p, s, t = pair(tmp_path)
-        seed(p, 8)
+        p, s, pump = pair(tmp_path)
+        t = pump.t
+        seed(p, 8, pump=pump)
         s.run_replication_cycle(t)
         # 再来一轮：整段重复 -> 全部跳过，不重复应用
         r = s.run_replication_cycle(t)
         assert r["applied"] == 0
         assert s.replica.synced_seq == 8
         # 模拟拉取页含重复段+新段（from=6）：6..8 跳过，新记录应用
-        seed(p, 2, start=8)
+        seed(p, 2, start=8, pump=pump)
         page = p.export_records(6, 10, p.cluster.term)
         assert [r["seq"] for r in page["records"]] == [6, 7, 8, 9, 10]
         applied = s.apply_records(page)
@@ -112,20 +170,22 @@ class TestBasicReplication:
         assert p.business_state()["state"] == s.business_state()["state"]
 
     def test_restart_keeps_progress(self, tmp_path):
-        p, s, t = pair(tmp_path)
-        seed(p, 6)
+        p, s, pump = pair(tmp_path)
+        t = pump.t
+        seed(p, 6, pump=pump)
         s.run_replication_cycle(t)
         cfg = s.cfg
         del s
         s2 = Kernel(cfg)
         rec = s2.startup()
         assert rec["replica"]["synced_seq"] == 6
-        seed(p, 2, start=6)
+        seed(p, 2, start=6, pump=pump)
         r = s2.run_replication_cycle(t)
         assert r["status"] == "caught_up" and r["synced_seq"] == 8
 
     def test_recent_error_recorded_and_cleared(self, tmp_path):
-        p, s, t = pair(tmp_path)
+        p, s, pump = pair(tmp_path)
+        t = pump.t
         # 指向不存在的来源 -> 记录最近错误，状态保持 syncing
         s.replica.peer_url = "local://NOPE"
         s.replica.persist()
@@ -136,22 +196,31 @@ class TestBasicReplication:
         # 恢复来源后成功一轮，错误清空
         s.replica.peer_url = "local://P"
         s.replica.persist()
-        seed(p, 2)
+        seed(p, 2, pump=pump)
         s.run_replication_cycle(t)
         assert s.replica.last_error is None
 
 
 class TestDivergence:
     def test_divergent_record_at_confirmed_position_conflicts(self, tmp_path):
-        p, s, t = pair(tmp_path)
-        x = make_kernel(tmp_path, "x", node_id="X", peers={"S": "local://S"})
+        p, s, pump = pair(tmp_path)
+        t = pump.t
+        x = make_kernel(tmp_path, "x", node_id="X", peers={})
         tx = direct_transport({"local://X": x})
         for i in range(3):
-            seed(p, 1, i)
-            seed(x, 1, i)
+            seed(p, 1, start=i, pump=pump)
+            seed(x, 1, start=i)
+        # seq4..6：主 P 经备复制取得多数确认；独立节点 X 各自本地确认
         for i in range(3, 6):
-            p.append("put", {"key": "from_p", "value": i})
+            try:
+                p.append("put", {"key": "from_p", "value": i},
+                         write_id=f"p-{i}", timeout_ms=100, transport=t)
+            except Error:
+                pump.commit_pending(p)
+                p.append("put", {"key": "from_p", "value": i},
+                         write_id=f"p-{i}", timeout_ms=2000, transport=t)
             x.append("put", {"key": "from_x", "value": 100 + i})
+        # 备已随 pump 复制；确保 synced 到 6
         s.run_replication_cycle(t)
         assert s.replica.synced_seq == 6
         x.append("put", {"key": "more", "value": 1})
@@ -174,8 +243,9 @@ class TestDivergence:
         assert view["replication"]["role_status"] == "idle"
 
     def test_duplicate_segment_with_different_digest_conflicts(self, tmp_path):
-        p, s, t = pair(tmp_path)
-        seed(p, 4)
+        p, s, pump = pair(tmp_path)
+        t = pump.t
+        seed(p, 4, pump=pump)
         s.run_replication_cycle(t)
         # 伪造一页：seq 3 是不同内容（prev 照旧伪装），且 seq 已被确认
         good = p.export_records(3, 2, p.cluster.term)["records"]
@@ -191,9 +261,9 @@ class TestDivergence:
 
 class TestSnapshotInstall:
     def test_fresh_standby_installs_boundary_then_follows(self, tmp_path):
-        p = make_kernel(tmp_path, "p", node_id="P", peers={"S": "local://S"},
+        p = make_kernel(tmp_path, "p", node_id="P", peers={},
                         segment_bytes=300)
-        seed(p, 30)
+        seed(p, 30)  # 独立主：本地写即提交
         r = p.compact(force=True)
         assert r["status"] == "ok" and r["range"]["last_seq"] >= 24
         s = make_kernel(tmp_path, "s", role="standby", node_id="S",
@@ -211,12 +281,16 @@ class TestSnapshotInstall:
         assert e.value.code == "compacted"
 
     def test_lagging_standby_reinstalls_boundary(self, tmp_path):
-        p, s, t = pair(tmp_path, segment_bytes=300)
-        seed(p, 20)
+        p, s, pump = pair(tmp_path, segment_bytes=300)
+        t = pump.t
+        seed(p, 20, pump=pump)
         s.run_replication_cycle(t)
+        # 压缩只能回收提交水位之内的段：先确保备已确认
+        pump.commit_pending(p)
         r = p.compact(force=True)
         assert r["status"] == "ok"
-        seed(p, 4, start=20)
+        seed(p, 4, start=20, pump=pump)
+        pump.commit_pending(p)
         # 把备库已确认位置人为回退到边界之内
         d5 = s.seglog.read_records(5, 1)[0]["digest"]
         s.replica.synced_seq = 5
@@ -229,25 +303,39 @@ class TestSnapshotInstall:
         assert p.business_state()["state"] == s.business_state()["state"]
 
     def test_batch_records_replicate_as_one_tail(self, tmp_path):
-        p, s, t = pair(tmp_path)
-        seed(p, 3)
+        p, s, pump = pair(tmp_path)
+        t = pump.t
+        seed(p, 3, pump=pump)
         s.run_replication_cycle(t)
         b = p.create_batch("order-x", 60_000)
         p.batch_add_ops(b["batch_id"], [
             {"type": "put", "payload": {"key": "ba", "value": 1}},
             {"type": "put", "payload": {"key": "bb", "value": 2}},
         ])
-        res = p.commit_batch(b["batch_id"])
-        r = s.run_replication_cycle(t)
-        assert r["synced_seq"] == res["last_seq"]
-        st = s.business_state()["state"]
-        assert st["ba"] == 1 and st["bb"] == 2
+        # 提交等待多数派：备先复制（整批到达），同 write_id 重试后整批提交
+        bid = b["batch_id"]
+        try:
+            res = p.commit_batch(bid, timeout_ms=100, transport=t)
+        except Error as e:
+            assert e.code == "commit_timeout", e.code
+            r = s.run_replication_cycle(t)
+            assert r["synced_seq"] == 5, r
+            wid = p.batches.get(bid).write_id
+            res = p.commit_batch(bid, write_id=wid, timeout_ms=2000, transport=t)
+        assert res["first_seq"] == 4 and res["last_seq"] == 5
+        assert res.get("committed") is True
+        # 批次在主备两侧都整体可见（不会只看到一半）
+        stp = p.business_state()["state"]
+        sts = s.business_state()["state"]
+        assert stp["ba"] == 1 and stp["bb"] == 2
+        assert sts == stp
+        assert s.commit.pending_ranges()["count"] == 0
 
     @pytest.mark.parametrize("hook", [
         "snapshot_after_verify", "snapshot_after_write", "snapshot_after_switch"])
     def test_install_crash_leaves_one_complete_state(self, tmp_path, hook):
         # 主：小段位 + 压缩边界
-        p = make_kernel(tmp_path, "p", node_id="P", peers={"S": "local://S"},
+        p = make_kernel(tmp_path, "p", node_id="P", peers={},
                         segment_bytes=300)
         seed(p, 24)
         p.compact(force=True)
@@ -293,10 +381,11 @@ class TestSnapshotInstall:
 
     def test_crash_after_records_fsync_resumes_without_dup(self, tmp_path):
         # 记录已入链、确认位置未推进：重启时对账前滚，不重复应用
-        p, s, t = pair(tmp_path)
-        seed(p, 5)
+        p, s, pump = pair(tmp_path)
+        t = pump.t
+        seed(p, 5, pump=pump)
         s.run_replication_cycle(t)
-        seed(p, 3, start=5)
+        seed(p, 3, start=5, pump=pump)
         # 再导入 3 条但把进度文件钉在 5（模拟 advance 前崩溃）
         page = p.export_records(6, 3, p.cluster.term)
         assert [r["seq"] for r in page["records"]] == [6, 7, 8]
@@ -307,7 +396,7 @@ class TestSnapshotInstall:
         s2 = Kernel(cfg)
         rec = s2.startup()
         assert rec["replica"]["synced_seq"] == 8
-        seed(p, 2, start=8)
+        seed(p, 2, start=8, pump=pump)
         r = s2.run_replication_cycle(t)
         assert r["applied"] == 2 and r["synced_seq"] == 10
         assert p.business_state()["state"] == s2.business_state()["state"]
@@ -328,13 +417,14 @@ class TestElectionAndGrant:
         assert e.value.code == "grant_expired"
 
     def test_cannot_promote_before_caught_up(self, tmp_path):
-        p, s, t = pair(tmp_path)
-        seed(p, 10)  # 备从未同步
+        p, s, pump = pair(tmp_path)
+        t = pump.t
+        seed(p, 10, pump=pump)  # 备从未同步
         with pytest.raises(Error) as e:
             s.campaign(term=2, voter_urls=["local://P", "local://S"], transport=t)
         assert e.value.code == "never_synced"
         s.run_replication_cycle(t)
-        seed(p, 5, start=10)  # 同步过但落后：来源边界前进到 15，本地停在 10
+        seed(p, 5, start=10, pump=pump)  # 同步过但落后：来源边界前进到 15，本地停在 10
         bnd = p.export_boundary()
         s.replica.set_boundary({
             "term": bnd["term"], "tip_seq": bnd["tip_seq"],
@@ -358,8 +448,9 @@ class TestElectionAndGrant:
         assert res["term"] == 2 and res["votes"] == 2
 
     def test_valid_primary_denies_votes_then_stepdown_allows(self, tmp_path):
-        p, s, t = pair(tmp_path)
-        seed(p, 4)
+        p, s, pump = pair(tmp_path)
+        t = pump.t
+        seed(p, 4, pump=pump)
         s.run_replication_cycle(t)
         # 当前主授权有效：拒绝更高/同任期投票
         resp = p.handle_request_vote(
@@ -376,14 +467,15 @@ class TestElectionAndGrant:
         assert s.cluster.role == "primary" and s.cluster.grant_valid()
 
     def test_only_one_winner_per_term_concurrent(self, tmp_path):
-        p, s, t = pair(tmp_path)
+        p, s, pump = pair(tmp_path)
+        t = pump.t
         third = make_kernel(tmp_path, "t", role="standby", node_id="T",
                             peers={"P": "local://P", "S": "local://S",
                                    "T": "local://T"},
                             source="local://P")
         t3 = direct_transport({"local://P": p, "local://S": s,
                                "local://T": third})
-        seed(p, 4)
+        seed(p, 4, pump=pump)
         s.run_replication_cycle(t)
         third.run_replication_cycle(t3)
         p.stepdown()
@@ -419,7 +511,7 @@ class TestElectionAndGrant:
                             source="local://P", grant_ttl=300_000)
         t3 = direct_transport({"local://P": p, "local://S": s,
                                "local://T": third})
-        seed(p, 4)
+        seed(p, 4)  # 主本地写入；备各自复制到同一条历史
         s.run_replication_cycle(t3)
         third.run_replication_cycle(t3)
         p.stepdown()
@@ -480,8 +572,9 @@ class TestElectionAndGrant:
                 if k.cluster.role == "primary"] == [winners[0]]
 
     def test_old_leader_old_term_rejected(self, tmp_path):
-        p, s, t = pair(tmp_path)
-        seed(p, 4)
+        p, s, pump = pair(tmp_path)
+        t = pump.t
+        seed(p, 4, pump=pump)
         s.run_replication_cycle(t)
         p.stepdown()
         s.campaign(term=2, voter_urls=["local://P", "local://S"], transport=t)
@@ -493,9 +586,17 @@ class TestElectionAndGrant:
         resp = s.handle_request_vote(
             {"term": 1, "candidate": "P", "last_log_seq": 4})
         assert resp["vote_granted"] is False and resp["reason"] == "stale_term"
-        # 新主写入生效
-        w = s.append("put", {"key": "new", "value": 1})
-        assert w["seq"] == 5
+        # 新主本地持久化写入（竞选已在 seq5 写入任期标记，业务记录是 seq6）
+        w = s.append("put", {"key": "new", "value": 1}, wait_commit=False)
+        assert w["seq"] == 6
+        # 旧主重新跟随新主：任期标记先确认，随后 seq6 取多数提交
+        p.configure_replica("local://S")
+        p.run_replication_cycle(t)
+        # 相同 write_id 重试返回同一 seq 6（不追加重复记录）
+        w2 = s.append("put", {"key": "new", "value": 1},
+                      write_id=w["write_id"], timeout_ms=2000, transport=t)
+        assert w2["seq"] == 6 and w2["committed"] is True and w2["replay"] is True
+        assert s.seglog.tip()[0] == 6
 
     def test_restart_does_not_revive_old_term(self, tmp_path):
         p = make_kernel(tmp_path, "p", node_id="P", grant_ttl=60_000)
@@ -523,8 +624,9 @@ class TestElectionAndGrant:
         assert p2.append("put", {"key": "b", "value": 2})["seq"] == 2
 
     def test_term_is_monotonic_and_standby_bumps(self, tmp_path):
-        p, s, t = pair(tmp_path)
-        seed(p, 1)
+        p, s, pump = pair(tmp_path)
+        t = pump.t
+        seed(p, 1, pump=pump)
         s.run_replication_cycle(t)
         # 备见到更高任期（来源主换届时）前滚本地任期
         p.cluster.assume_leadership(5, 60_000)
@@ -544,8 +646,9 @@ class TestElectionAndGrant:
         assert "stale" not in s.business_state()["state"]
 
     def test_vote_denied_for_behind_candidate(self, tmp_path):
-        p, s, t = pair(tmp_path)
-        seed(p, 10)
+        p, s, pump = pair(tmp_path)
+        t = pump.t
+        seed(p, 10, pump=pump)
         s.run_replication_cycle(t)
         # 授权过期后才接受更高任期的投票请求；但候选日志落后仍拒绝
         p.cluster.s.grant_expires_at = 1
@@ -555,21 +658,25 @@ class TestElectionAndGrant:
         assert resp["vote_granted"] is False and resp["reason"] == "candidate_behind"
 
     def test_old_primary_follows_new_primary_then_restarts(self, tmp_path):
-        p, s, t = pair(tmp_path)
-        seed(p, 6)
+        p, s, pump = pair(tmp_path)
+        t = pump.t
+        seed(p, 6, pump=pump)
         s.run_replication_cycle(t)
         p.stepdown()
         s.campaign(term=2, voter_urls=["local://P", "local://S"], transport=t)
-        # 新主写入；旧主转为备跟随，只拉增量（不重装、不重复）
-        seed(s, 2, start=6)
+        # 竞选产生新任期标记（seq7）；旧主确认后它随提交水位生效
         p.configure_replica("local://S")
         r = p.run_replication_cycle(t)
-        assert r["applied"] == 2 and r["synced_seq"] == 8
         assert p.cluster.term == 2 and p.cluster.role == "standby"
+        assert r["synced_seq"] == 7 and r["status"] == "caught_up", r
+        # 新主写入两条（seq8..9）；旧主只拉增量（不重装、不重复）
+        seed(s, 2, start=6)
+        r = p.run_replication_cycle(t)
+        assert r["applied"] == 2 and r["synced_seq"] == 9, r
         assert p.business_state()["state"] == s.business_state()["state"]
         seed(s, 2, start=8)
         r = p.run_replication_cycle(t)
-        assert r["synced_seq"] == 10 and r["status"] == "caught_up"
+        assert r["synced_seq"] == 11 and r["status"] == "caught_up", r
         # 重启后角色/任期/复制进度都保持，继续增量
         cfg = p.cfg
         del p
@@ -578,14 +685,12 @@ class TestElectionAndGrant:
         assert p2.cluster.role == "standby" and p2.cluster.term == 2
         seed(s, 1, start=10)
         r = p2.run_replication_cycle(t)
-        assert r["synced_seq"] == 11 and r["status"] == "caught_up"
+        assert r["synced_seq"] == 12 and r["status"] == "caught_up", r
         assert p2.business_state()["state"] == s.business_state()["state"]
 
     def test_old_primary_with_divergent_history_cannot_follow(self, tmp_path):
-        s = make_kernel(tmp_path, "s", node_id="S",
-                        peers={"O": "local://O", "S": "local://S"})
-        o = make_kernel(tmp_path, "o", node_id="O",
-                        peers={"O": "local://O", "S": "local://S"})
+        s = make_kernel(tmp_path, "s", node_id="S", peers={})
+        o = make_kernel(tmp_path, "o", node_id="O", peers={})
         # 同序号、不同内容的两条独立历史
         seed(s, 5)
         seed(o, 5)

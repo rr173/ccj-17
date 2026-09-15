@@ -118,6 +118,7 @@ if __name__ == "__main__":
     run_module("tests.test_kernel")
     run_module("tests.test_server")
     run_module("tests.test_replication")
+    run_module("tests.test_consensus")
     run_module("tests.test_server_replication")
     print()
     for label, tb in FAILURES:

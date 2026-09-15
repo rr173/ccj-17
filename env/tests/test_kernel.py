@@ -391,7 +391,9 @@ class TestChainHeadAnchor:
         assert e.value.code == "tail_corrupt"
 
     def test_crash_lagging_anchor_fast_forwards(self, tmp_path):
-        # 段记录已 fsync、锚点尚未落盘（崩溃窗口）：重启核对后前滚锚点
+        # 段记录已 fsync、锚点尚未落盘（崩溃窗口）：重启核对后前滚锚点。
+        # 多数派提交语义下，直接写入段文件的记录没有 write 登记，属待定
+        # 记录（业务状态默认不可见），但哈希链与链头锚点必须照常前滚。
         k = make_kernel(tmp_path)
         seed(k, 3)
         tip_seq, tip_d = k.seglog.tip()
@@ -404,8 +406,18 @@ class TestChainHeadAnchor:
             os.fsync(f.fileno())
         k2 = make_kernel(tmp_path)
         assert k2.seglog.tip()[0] == tip_seq + 1
-        assert k2.business_state()["state"]["kx"] == 9
+        # 待定记录不在默认业务状态/读取中（尚未越过提交水位）
+        assert "kx" not in k2.business_state()["state"]
+        # 待定位置读取返回空页（不暴露未确认内容）
+        page = k2.read(tip_seq + 1, 1)
+        assert page["records"] == [] and page["ahead_of_commit"] is True
         assert read_json(k2.head_path)["seq"] == tip_seq + 1
+        # 链本身完整：显式折叠整段（含待定尾部）业务等价
+        full = Reducer()
+        for sid in sorted(k2.seglog.segments):
+            for r in k2.seglog.iter_segment(sid):
+                full.apply(r["type"], r["payload"])
+        assert full.snapshot().get("kx") == 9
 
     def test_clean_restart_unaffected(self, tmp_path):
         k = make_kernel(tmp_path)
@@ -770,9 +782,7 @@ class TestBatch:
         for i in range(8):
             k.append("put", {"key": f"k{i}", "value": i})
         assert len(k.seglog.segments) >= 3
-        k.seglog.truncate_tail(3)
-        k._sync_tip("0" * 64)
-        k._persist_head()
+        k._truncate_tail_chain(3)
         assert k.seglog.tip()[0] == 3
         assert k.seglog.verify_chain().ok
         rec = k.append("put", {"key": "n", "value": 1})
@@ -783,10 +793,9 @@ class TestBatch:
         k = make_kernel(tmp_path)
         for i in range(3):
             k.append("put", {"key": f"k{i}", "value": i})
-        k.seglog.truncate_tail(0)  # 整批从 seq1 开始 -> 全部回滚
-        k._sync_tip("0" * 64)
-        k._persist_head()
+        k._truncate_tail_chain(0)  # 整批从 seq1 开始 -> 全部回滚
         assert k.seglog.tip()[0] == 0
+        assert k.commit.commit_index == 0
         assert k.business_state()["state"] == {}
         assert k.append("put", {"key": "n", "value": 1})["seq"] == 1
         # 重启后依旧稳定（链头锚点与空链尖一致）
@@ -835,29 +844,34 @@ class TestBatchCrashRecovery:
         r = k.commit_batch(rb[0])  # 重试成功
         assert r["first_seq"] == 4 and r["last_seq"] == 5
 
-    def test_crash_after_append_rolls_back_whole_batch(self, tmp_path):
-        # 崩溃于整批记录已入链、幂等登记（提交点）之前
+    def test_crash_after_append_keeps_pending_batch(self, tmp_path):
+        # 崩溃于整批记录已在本地 fsync、多数派确认之前：批次保持待定，
+        # 链上记录不回退（多数派提交语义：本地已持久化尾部等待确认），
+        # 默认读取/业务状态不暴露，重试提交继续同一序号区间。
         k, rec = self._crash_then_recover(tmp_path, "batch_after_append")
-        rb = rec["batches"]["rolled_back"]
-        assert len(rb) == 1
-        # 整批未提交：链尾回到批次之前，业务状态无半批记录
-        assert k.seglog.tip()[0] == 3
+        pend = rec["batches"]["pending"]
+        assert len(pend) == 1
+        assert k.seglog.tip()[0] == 5  # 记录都在
+        # 待定批次对默认读取/业务状态不可见
         assert k.business_state()["state"] == {"base0": 0, "base1": 1, "base2": 2}
-        assert k.batch_view(rb[0])["status"] == "open"
-        # 回滚不占序号：重试提交拿到同一 first_seq
-        r = k.commit_batch(rb[0])
+        assert k.batch_view(pend[0])["status"] == "committing"
+        assert k.commit.pending_ranges()["first_seq"] == 4
+        # 单节点重启后多数派即自己：重试提交立即确认同一序号区间
+        r = k.commit_batch(pend[0])
         assert (r["first_seq"], r["last_seq"]) == (4, 5)
-        assert k.business_state()["state"]["bx"] == 1
+        assert r.get("committed") is True
+        st = k.business_state()["state"]
+        assert st["bx"] == 1 and st["by"] == 2
         assert k.seglog.verify_chain().ok
 
     def test_crash_after_append_with_segment_rollover(self, tmp_path):
-        # 小段：批次提交中途触发滚动，回滚要跨段截断并删除滚出的段
+        # 小段：批次记录跨段后崩溃于多数确认前；保持待定、不跨段截断
         k, rec = self._crash_then_recover(tmp_path, "batch_after_append", seg_bytes=150)
-        rb = rec["batches"]["rolled_back"]
-        assert len(rb) == 1
-        assert k.seglog.tip()[0] == 3
+        pend = rec["batches"]["pending"]
+        assert len(pend) == 1
+        assert k.seglog.tip()[0] == 5
         assert k.business_state()["state"] == {"base0": 0, "base1": 1, "base2": 2}
-        r = k.commit_batch(rb[0])
+        r = k.commit_batch(pend[0])
         assert r["first_seq"] == 4
         assert k.seglog.verify_chain().ok
         st = k.business_state()["state"]

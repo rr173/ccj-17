@@ -77,7 +77,10 @@ class Server:
     def append_puts(self, n, start=0):
         for i in range(start, start + n):
             st, b = self.call("POST", "/append",
-                              {"type": "put", "payload": {"key": f"k{i % 3}", "value": i}})
+                              {"type": "put",
+                               "payload": {"key": f"k{i % 3}", "value": i},
+                               "write_id": f"{self.tmp}-{i}",
+                               "timeout_ms": 8000}, timeout=12)
             assert st == 201, b
 
     def wait_until(self, fn, timeout=5.0):
@@ -122,7 +125,7 @@ def test_replication_and_promotion_over_http(tmp_path):
                              f"http://127.0.0.1:{pp}", f"http://127.0.0.1:{sp}"]})
         assert st == 409 and err["error"] == "election_lost", err
 
-        # 交接后提升成功
+        # 交接后提升成功；新主先写入一条当前任期标记，业务写入序号顺延
         st, b = p.call("POST", "/cluster/stepdown", {})
         assert st == 200
         st, b = s.call("POST", "/cluster/promote",
@@ -130,17 +133,45 @@ def test_replication_and_promotion_over_http(tmp_path):
                            f"http://127.0.0.1:{pp}", f"http://127.0.0.1:{sp}"]})
         assert st == 200 and b["term"] == 2 and b["votes"] == 2, b
 
-        # 新主可写；旧主拒绝写
+        # 旧主交接后转去跟随新主；否则它的确认位置不会前进
+        st, _ = p.call("POST", "/replica", {"peer_url": f"http://127.0.0.1:{sp}"})
+        assert st == 200
+        # 新主写入：首次等待多数确认（旧主正在重新跟随），可能超时；
+        # 相同 write_id 重试继续同一提交，同一序号、不重复入链。
         st, w = s.call("POST", "/append",
-                       {"type": "put", "payload": {"key": "after", "value": 1}})
-        assert st == 201 and w["seq"] == 16
+                       {"type": "put", "payload": {"key": "after", "value": 1},
+                        "write_id": "after-1", "timeout_ms": 8000}, timeout=12)
+        if st != 201:
+            assert w["error"] == "commit_timeout", w
+            def write_committed():
+                _st, v = s.call("GET", "/replica")
+                return v if v.get("commit_index", 0) >= 17 else None
+            s.wait_until(write_committed, timeout=8.0)
+            st, w = s.call("POST", "/append",
+                           {"type": "put", "payload": {"key": "after", "value": 1},
+                            "write_id": "after-1", "timeout_ms": 8000}, timeout=12)
+        assert st == 201 and w["committed"] is True and w["seq"] == 17, w
         st, err = p.call("POST", "/append",
                          {"type": "put", "payload": {"key": "stale", "value": 1}})
         assert st == 403
 
-        # 状态接口区分可写主与授权失效
+        # 状态接口区分可写主与授权失效；提交水位、待定区间、成员确认可见
         st, vs = s.call("GET", "/replica")
         assert vs["phase"] == "writable_primary"
+        assert vs["commit_index"] >= 17
+        assert vs["pending"]["count"] == 0
+        assert vs["member_acks"]["P"]["match_seq"] >= 17
+
+        # 线性一致读：主在当前任期拿到多数派读屏障后返回提交水位内状态
+        st, lr = s.call("GET", "/state?consistency=linearizable&timeout_ms=5000")
+        assert st == 200 and lr["state"].get("after") == 1, lr
+        assert lr["read_barrier"]["verified"] is True
+        # 备实例拒绝线性一致读，并返回角色、任期与已知主
+        st2, le = p.call("GET", "/state?consistency=linearizable")
+        assert st2 == 403 and le["error"] == "not_primary"
+        assert le["details"]["role"] == "standby"
+        assert le["details"]["term"] == 2
+        assert le["details"]["primary"]
 
 
 def test_standby_restart_resumes_and_status_phases(tmp_path):

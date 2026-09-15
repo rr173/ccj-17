@@ -26,6 +26,9 @@ PATH_RECORDS = "/replica/records"
 PATH_SNAPSHOT = "/replica/snapshot"
 PATH_REQUEST_VOTE = "/cluster/request_vote"
 PATH_LEASE = "/cluster/lease"
+PATH_ACK = "/cluster/ack"
+PATH_APPEND = "/cluster/append_entries"
+PATH_PROGRESS = "/cluster/progress"
 
 
 class TransportError(Exception):
@@ -88,6 +91,18 @@ def direct_transport(peers: dict[str, Any]) -> Transport:
                 return 200, k.export_snapshot(int(qs.get("gen", 0)), int(qs.get("term", 0)))
             if path == PATH_REQUEST_VOTE:
                 return 200, k.handle_request_vote(body or {})
+            if path == PATH_ACK:
+                return 200, k.handle_ack(
+                    str((body or {}).get("node_id", "?")),
+                    int((body or {}).get("term", 0)),
+                    int((body or {}).get("match_seq", 0)),
+                    int((body or {}).get("commit_seq", 0)),
+                    barrier=bool((body or {}).get("barrier", False)),
+                    commit_digest=(body or {}).get("commit_digest"))
+            if path == PATH_APPEND:
+                return 200, k.handle_append_entries(body or {})
+            if path == PATH_PROGRESS:
+                return 200, k.handle_progress()
             if path == PATH_LEASE:
                 return 200, k.handle_lease_ack(int(qs.get("term", 0)))
             raise TransportError(404, "no_route", {"path": path}, url)
@@ -147,3 +162,97 @@ class LeaseRefresher(_StopLoop):
                 # 网络抖动等：本轮不续期；连续失败到过期后写入即被拒
                 if not self.k.cluster.grant_valid():
                     return
+
+
+class LeaderPusher(_StopLoop):
+    """主实例主动推送：故障切换后旧主不会自动改拉新主，由主推送增量。
+
+    周期性把提交水位之后的记录推给已知投票成员；备端走与拉取相同的
+    apply_records 校验路径，确认位置随 RPC 响应返回并计入主的多数派提交。
+    """
+
+    def __init__(self, kernel, interval_ms: int,
+                 transport: Optional[Transport] = None):
+        super().__init__("leader-pusher", max(0.05, interval_ms / 1000))
+        self.k = kernel
+        self.transport = transport or http_transport
+
+    def run(self) -> None:
+        while not self.stop_evt.wait(self.interval):
+            try:
+                if self.k.cluster.role != "primary":
+                    return
+                for nid, url in self.k.cfg.peers.items():
+                    if nid == self.k.cluster.node_id:
+                        continue
+                    self.k.leader_push_once(url.rstrip("/"), self.transport)
+            except Exception:
+                pass
+
+
+class ClusterSupervisor(_StopLoop):
+    """角色驱动的后台循环：随当前角色启动/停止拉取、续租与主动推送。
+
+    故障切换是运行时事件（不重启进程）：旧主被更高任期心跳降为备后必须
+    开始跟随新主，备竞选成功后必须开始续租与主动推送。本线程按当前角色
+    管理这些子循环的生命周期；子线程均为 daemon，监督线程退出时一起回收。
+    """
+
+    def __init__(self, kernel, replication_interval_ms: int,
+                 lease_interval_ms: int, grant_ttl_ms: int,
+                 transport: Optional[Transport] = None):
+        super().__init__("cluster-supervisor",
+                         max(0.05, min(replication_interval_ms,
+                                       lease_interval_ms) / 1000 / 2))
+        self.k = kernel
+        self.replication_interval_ms = replication_interval_ms
+        self.lease_interval_ms = lease_interval_ms
+        self.grant_ttl_ms = grant_ttl_ms
+        self.transport = transport or http_transport
+        self._children: list[_StopLoop] = []
+
+    def _stop_children(self) -> None:
+        for c in self._children:
+            c.stop()
+        self._children = []
+
+    def _reconcile(self) -> None:
+        role = self.k.cluster.role
+        # 备实例只要配置了复制来源就拉取（即使没有 PEERS 选举成员）；
+        # 主实例的续租/主动推送只在多节点集群中进行。
+        want = {
+            "replicator": role == "standby" and (
+                bool(self.k.cfg.peers) or bool(self.k.replica.peer_url)),
+            "refresher": role == "primary" and bool(self.k.cfg.peers),
+            "pusher": role == "primary" and bool(self.k.cfg.peers)}
+        have = {("replicator" if isinstance(c, Replicator)
+                 else "refresher" if isinstance(c, LeaseRefresher)
+                 else "pusher" if isinstance(c, LeaderPusher) else "?"): c
+                for c in self._children}
+        for name, on in want.items():
+            if bool(name in have) != on:
+                if not on:
+                    c = have.pop(name, None)
+                    if c:
+                        c.stop()
+                        self._children = [x for x in self._children if x is not c]
+                else:
+                    if name == "replicator":
+                        c = Replicator(self.k, self.replication_interval_ms,
+                                       self.transport)
+                    elif name == "refresher":
+                        c = LeaseRefresher(self.k, self.lease_interval_ms,
+                                           self.grant_ttl_ms, self.transport)
+                    else:
+                        c = LeaderPusher(self.k, self.replication_interval_ms,
+                                         self.transport)
+                    c.start()
+                    self._children.append(c)
+
+    def run(self) -> None:
+        while not self.stop_evt.wait(self.interval):
+            try:
+                self._reconcile()
+            except Exception:
+                pass
+        self._stop_children()

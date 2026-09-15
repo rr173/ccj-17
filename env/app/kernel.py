@@ -44,6 +44,7 @@ from .common import (
     sha256_file,
     write_json,
 )
+from .consensus import CommitStore, Proposal, new_write_id
 from .readers import ReaderStore
 from .reducer import Reducer
 from .replica import CAUGHT_UP, CONFLICT, IDLE, SYNCING, ReplicaStore
@@ -70,6 +71,8 @@ class Config:
     replication_interval_ms: int = 500  # 备库拉取间隔
     replication_batch: int = 500        # 单次拉取记录上限
     replica_source: Optional[str] = None  # 首次以 standby 引导时的来源 URL
+    commit_timeout_ms: int = 3_000      # 多数派提交等待上限（超时返回 commit_timeout）
+    read_barrier_timeout_ms: int = 3_000  # 线性一致读屏障等待上限
 
 
 def _vfail(reason: Any, proof: dict | None = None) -> dict:
@@ -108,12 +111,18 @@ class Kernel:
                 ttl = cfg.grant_ttl_ms if len(self.cluster.s.voters) > 1 else MAX_GRANT_TTL_MS
                 self.cluster.assume_leadership(1, ttl)
         self.replica = ReplicaStore(os.path.join(self.state_dir, "replica.json"))
+        # ---- 多数派提交水位 / 待定提议 / write_id 登记 / 成员确认位置 ----
+        self.commit = CommitStore(os.path.join(self.state_dir, "commit.json"))
         if self.cluster.fresh and cfg.bootstrap_role == STANDBY and cfg.replica_source:
             self.replica.peer_url = cfg.replica_source.rstrip("/")
             self.replica.status = SYNCING
             self.replica.persist()
 
         self.meta_lock = threading.RLock()
+        # 提交事件由处理 ack 的线程持独立条件锁广播；等待提交的写线程
+        # 先在 meta_lock 内检查状态、再在此条件上释放锁等待，被唤醒后
+        # 重新进入 meta_lock 复核，避免「提交发生在检查与等待之间」的窗口。
+        self._commit_cv = threading.Condition()
         self._compact_active = False
         self.last_compact: dict[str, Any] = {}
         if os.path.exists(self.result_path):
@@ -174,8 +183,9 @@ class Kernel:
                 anchor = pointer["tail_anchor"]
                 recovery.update(boundary=f"gen-{gen}", segments_deleted=deleted_now, gens_pruned=pruned)
 
-            # 批次崩溃恢复：committing 批次只能恢复成整批已提交或整批未提交，
-            # 绝不暴露半批记录（须在链头锚点核对之前完成截断）
+            # 批次崩溃恢复：committing 批次只能恢复成整批已提交、整批未提交，
+            # 或「本地已整批持久化、等待多数确认」的待定状态（绝不暴露半批）；
+            # 截断必须在链头锚点核对之前完成。
             batch_rec = self._recover_batches()
             if batch_rec:
                 recovery["batches"] = batch_rec
@@ -185,6 +195,7 @@ class Kernel:
                 self._persist_head()
             self._reconcile_head()
             recovery["replica"] = self._reconcile_replica()
+            recovery["commit"] = self._reconcile_commit()
             return recovery
 
     def _finish_prefix_cleanup(self, pointer: dict, pending_seq: int) -> list[int]:
@@ -267,26 +278,197 @@ class Kernel:
         return {"status": rep.status, "synced_seq": rep.synced_seq}
 
     def _recover_batches(self) -> dict:
-        """清算 committing 状态的批次：已登记的补记为整批已提交，否则整批回滚。"""
+        """清算 committing 状态的批次。
+
+        - 幂等登记已存在（提交点已过）：补记为整批已提交；
+        - 批次记录完整留在链上、但提交点未到：多数派提交语义下仍可能在
+          等待确认（主在本地持久化后崩溃），保留为 committing，提交水位
+          重建后继续等待多数派（见 _reconcile_commit），不截断、不回退；
+        - 批次记录没有完整落盘（崩溃在追加途中）：整批未提交，截断链尾，
+          批次回到 open 可在有效期内重试，不留序号空洞。
+        """
         finalized: list[str] = []
         rolled_back: list[str] = []
+        pending: list[str] = []
         for b in self.batches.committing_batches():
             entry = self.batches.commit_entry(b.registry_key())
-            if entry is not None and entry.get("content_hash") == b.content_hash:
-                # 提交点（幂等登记落盘）已过：整批已提交，补记批次状态
+            first = b.first_seq or 1
+            present = self._batch_records_present(b, first)
+            if entry is not None and entry.get("content_hash") == b.content_hash \
+                    and present and int(entry["last_seq"]) <= self.commit.commit_index:
+                # 幂等登记已落盘且整批已进入提交水位：整批已提交，补记状态
                 self.batches.mark_committed(b, entry, replay=False)
                 finalized.append(b.batch_id)
+                continue
+            if present:
+                # 整批已在本地链上 fsync，但尚未进入提交水位（崩溃在多数派
+                # 确认之前）：保留 committing，由 _reconcile_commit 重建为
+                # 待定提议；主重启后续等多数派，绝不静默当作已提交。
+                b.last_seq = first + len(b.ops) - 1
+                b.record_count = len(b.ops)
+                pending.append(b.batch_id)
+                continue
+            # 整批未完成：批次记录必是链尾后缀，截断回滚，批次回到 open。
+            keep = first - 1
+            if self.seglog.tip()[0] > keep:
+                self.seglog.truncate_tail(keep)
+            if self.commit.commit_index > keep:
+                self.commit.commit_index = keep
+                self.commit.commit_digest = self._digest_or_anchor(keep) or GENESIS
+            self.commit.prune_pending_through(keep)
+            self.commit.persist()
+            self.batches.rollback_to_open(b)
+            rolled_back.append(b.batch_id)
+        out: dict[str, Any] = {}
+        if finalized:
+            out["finalized"] = finalized
+        if rolled_back:
+            out["rolled_back"] = rolled_back
+        if pending:
+            out["pending"] = pending
+        return out
+
+    def _batch_records_present(self, b: Batch, first_seq: int) -> bool:
+        """committing 批次的全部记录是否完整连续地留在链上（含摘要链衔接）。"""
+        n = len(b.ops)
+        if n <= 0:
+            return False
+        recs = self.seglog.read_records(first_seq, n)
+        if len(recs) != n:
+            return False
+        anchor = self._digest_or_anchor(first_seq - 1)
+        for i, r in enumerate(recs):
+            if r["seq"] != first_seq + i or r["prev"] != anchor:
+                return False
+            anchor = r["digest"]
+        return True
+
+    def _reconcile_commit(self) -> dict:
+        """启动时对账提交水位、待定提议与 write_id 登记。
+
+        - commit_index 位置必须在本地链上（或恰为快照边界）且摘要一致；
+        - 待定提议按现存链 + 写入登记 + committing 批次重建；
+        - 本地链尖已到达的待多数确认记录（主在 fsync 后崩溃）保持待定，
+          重启为当前主后继续等待多数派，绝不静默当作已提交；
+        - 登记中 first_seq 已超出本地链尖（记录没落盘就崩溃）的写入标记
+          为未开始：同 write_id 重试续用同一序号占位。
+        """
+        cs = self.commit
+        tip_seq, _tip_digest = self.seglog.tip()
+        if cs.commit_index > tip_seq:
+            pointer = self.checkpoints.current
+            if pointer is None or cs.commit_index != int(pointer["seq"]):
+                raise err(500, "tail_corrupt",
+                          "commit watermark is beyond the local log; refusing to start",
+                          commit_index=cs.commit_index, tip_seq=tip_seq)
+        elif cs.commit_index > 0:
+            at = self._digest_or_anchor(cs.commit_index)
+            if at is not None and at != cs.commit_digest and cs.commit_digest != GENESIS:
+                raise err(500, "tail_corrupt",
+                          "commit watermark digest does not match the log; refusing",
+                          commit_index=cs.commit_index)
+        if cs.commit_index > 0 and cs.commit_digest == GENESIS:
+            d = self._digest_or_anchor(cs.commit_index)
+            if d:
+                cs.commit_digest = d
+        # 未真正落盘的写入登记（记录不在链上）：转为未开始，等待同 write_id 重试
+        dormant: list[str] = []
+        for wid, e in list(cs.writes.items()):
+            if e.get("status") == "pending" and int(e["first_seq"]) > tip_seq:
+                dormant.append(wid)
+        # 本地整批持久化但未提交水位的批次：以其 write_id（缺省以批次 id 兜底）
+        # 重建 write 登记，相同 write_id 重试继续同一序号区间。
+        for b in self.batches.committing_batches():
+            if b.first_seq and self._batch_records_present(b, b.first_seq) \
+                    and b.last_seq and b.last_seq > cs.commit_index:
+                wid = b.write_id or f"batch:{b.batch_id}"
+                b.write_id = wid
+                if cs.get_write(wid) is None:
+                    cs.register_write(wid, self.cluster.term, b.first_seq,
+                                      b.last_seq, kind="batch",
+                                      batch_id=b.batch_id)
+        # 重建待定提议
+        self._rebuild_pending_locked()
+        if dormant:
+            for wid in dormant:
+                cs.writes[wid]["status"] = "unstarted"
+            cs.persist()
+        return {"commit_index": cs.commit_index,
+                "pending": len(cs.pending),
+                "dormant_writes": dormant}
+
+    def _rebuild_pending_locked(self) -> None:
+        """依据现存链、write_id 登记与 committing 批次重建 commit_index 之后的待定提议。
+
+        日志位置按以下归属拆成提议（不允许跨提议边界推进水位）：
+          term_marker（内部 data 记录）；
+          整批已持久化的 committing 批次（整段属于该批次）；
+          其余每条登记在 writes 中的记录一条普通写提议；
+          未知记录（理论上不该出现的无登记项）以最保守的单条提议占位，
+          term=0（永远不满足「当前任期先提交一条」的前提交条件）。
+        """
+        cs = self.commit
+        commit_seq = cs.commit_index
+        tip_seq, _ = self.seglog.tip()
+        proposals: list[Proposal] = []
+        seq = commit_seq + 1
+        committing = [b for b in self.batches.committing_batches()
+                      if (b.first_seq or 0) > commit_seq
+                      and self._batch_records_present(b, b.first_seq)]
+        while seq <= tip_seq:
+            rec = self._record_at(seq)
+            if rec is None:
+                break  # 链在快照空洞：剩余部分未知，交快照边界处理
+            if self._is_term_marker(rec):
+                t = int(rec["payload"].get("term", 0))
+                self.commit.add_term_marker(seq, t)
+                proposals.append(Proposal(seq, seq, term=t, kind="term_marker"))
+                seq += 1
+                continue
+            batch = next((b for b in committing if b.first_seq == seq), None)
+            if batch is not None:
+                last_seq = seq + len(batch.ops) - 1
+                proposals.append(Proposal(
+                    seq, last_seq, term=self.commit.term_at(seq), kind="batch",
+                    write_id=batch.write_id, batch_id=batch.batch_id))
+                seq = last_seq + 1
+                continue
+            entry = None
+            for e in cs.writes.values():
+                if int(e["first_seq"]) == seq and int(e["last_seq"]) == seq:
+                    entry = e
+                    break
+            if entry is not None:
+                proposals.append(Proposal(
+                    seq, seq, term=int(entry.get("term", self.commit.term_at(seq))),
+                    kind="write", write_id=entry["write_id"]))
             else:
-                # 提交点未到：整批未提交。批次记录必是链尾后缀，截断回滚，
-                # 批次回到 open（有效期内可重试），不占任何日志序号。
-                keep = (b.first_seq or 1) - 1
-                if self.seglog.tip()[0] > keep:
-                    self.seglog.truncate_tail(keep)
-                self.batches.rollback_to_open(b)
-                rolled_back.append(b.batch_id)
-        if not (finalized or rolled_back):
-            return {}
-        return {"finalized": finalized, "rolled_back": rolled_back}
+                # 无登记的尾部记录：最保守地按单条未知任期提议处理
+                proposals.append(Proposal(seq, seq, term=0, kind="write"))
+            seq += 1
+        cs.pending = proposals
+        cs.persist()
+
+    @staticmethod
+    def _is_term_marker(rec: dict) -> bool:
+        return rec.get("type") == "data" and isinstance(rec.get("payload"), dict) \
+            and rec["payload"].get("kind") == "term_marker"
+
+    def _record_at(self, seq: int) -> Optional[dict]:
+        recs = self.seglog.read_records(seq, 1)
+        return recs[0] if recs else None
+
+    def _digest_or_anchor(self, seq: int) -> Optional[str]:
+        """链上 seq 处摘要；seq==0 -> GENESIS；落在快照边界 -> tail_anchor。"""
+        if seq <= 0:
+            return GENESIS
+        d = self._digest_at(seq)
+        if d is not None:
+            return d
+        pointer = self.checkpoints.current
+        if pointer is not None and seq == int(pointer["seq"]):
+            return pointer["tail_anchor"]
+        return None
 
     def _verify_pointer_target(self, pointer: dict, snap_body: dict, man_body: dict) -> None:
         if snap_body["snapshot_seq"] != pointer["seq"]:
@@ -402,25 +584,617 @@ class Kernel:
                       "a new election is required",
                       term=self.cluster.term)
 
-    def append(self, rec_type: str, payload: Any) -> dict:
+    def _validate_write_id(self, write_id: Any) -> str:
+        if write_id is None:
+            return new_write_id()
+        if not isinstance(write_id, str) or not (1 <= len(write_id) <= 256):
+            raise err(400, "bad_request", "write_id must be a string of length 1..256")
+        return write_id
+
+    def _clamp_commit_timeout(self, timeout_ms: Any, default_ms: Optional[int] = None) -> int:
+        if timeout_ms is None:
+            return default_ms if default_ms is not None else self.cfg.commit_timeout_ms
+        try:
+            t = int(timeout_ms)
+        except (TypeError, ValueError):
+            raise err(400, "bad_request", "timeout_ms must be an integer")
+        if not (50 <= t <= 120_000):
+            raise err(400, "bad_request", "timeout_ms must be in [50,120000]")
+        return t
+
+    def _append_record_locked(self, rec_type: str, payload: Any) -> dict:
+        """在已持锁情况下把一条记录追加到本地链（fsync + 链头锚点 + 滚动）。"""
+        rec = self.seglog.append(rec_type, payload, now_ms())
+        # 段记录已 fsync，再锚定链尖：崩溃只会让锚点落后一条，
+        # 启动时按 _reconcile_head 的「落后」分支核对前滚，绝不误伤。
+        self._persist_head()
+        if self.seglog.segments[self.seglog.active_id].size >= self.cfg.segment_bytes:
+            self.seglog.rotate()
+        return {
+            "seq": rec["seq"],
+            "ts": rec["ts"],
+            "type": rec["type"],
+            "payload": rec["payload"],
+            "prev": rec["prev"],
+            "digest": rec["digest"],
+        }
+
+    def append(self, rec_type: str, payload: Any, write_id: Optional[str] = None,
+               timeout_ms: Optional[int] = None, wait_commit: bool = True,
+               transport: Optional[Callable] = None) -> dict:
+        """追加一条记录并等待多数派提交（默认）。
+
+        - write_id 由调用方提供（缺省自动生成）；相同 write_id 重试永远
+          续用同一任期/序号：已提交 -> 原结果重放；等待中 -> 继续等；
+          被新任期截断 -> 409 commit_superseded，绝不追加重复记录。
+        - 主先把记录持久化到本地，再等当前任期多数投票成员确认同一日志
+          位置；超时返回 504 commit_timeout（记录仍是待定状态）。
+        """
+        timeout = self._clamp_commit_timeout(timeout_ms)
+        wid = self._validate_write_id(write_id)
         with self.meta_lock:
             self._require_writable_primary()
+            term = self.cluster.term
+            existing = self.commit.get_write(wid)
+            if existing is not None:
+                return self._resume_write_locked(existing, timeout, wait_commit, transport)
             # 入链前校验业务负载，坏记录绝不进哈希链
             Reducer().apply(rec_type, payload)
-            rec = self.seglog.append(rec_type, payload, now_ms())
-            # 段记录已 fsync，再锚定链尖：崩溃只会让锚点落后一条，
-            # 启动时按 _reconcile_head 的「落后」分支核对前滚，绝不误伤。
-            self._persist_head()
-            if self.seglog.segments[self.seglog.active_id].size >= self.cfg.segment_bytes:
-                self.seglog.rotate()
+            rec = self._append_record_locked(rec_type, payload)
+            seq = rec["seq"]
+            self.commit.register_write(wid, term, seq, seq, kind="write")
+            self.commit.add_proposal(Proposal(seq, seq, term=term,
+                                              kind="write", write_id=wid))
+            self.commit.persist()
+            self._advance_commit_locked()
+            result = self._write_result(rec, wid, term, seq, seq)
+            if self.commit.commit_index >= seq:
+                result["committed"] = True
+                result["commit_index"] = self.commit.commit_index
+                return result
+        if not wait_commit:
+            result["committed"] = False
+            result["status"] = "pending"
+            return result
+        return self._await_commit(wid, term, seq, seq, result, timeout, transport)
+
+    def _resume_write_locked(self, existing: dict, timeout: int, wait_commit: bool,
+                             transport: Optional[Callable]) -> dict:
+        """相同 write_id 重试：续用原提交过程，绝不追加重复记录。"""
+        wid = existing["write_id"]
+        first, last = int(existing["first_seq"]), int(existing["last_seq"])
+        term = int(existing["term"])
+        if existing.get("status") == "committed":
+            return self._committed_write_view(existing, replay=True)
+        if existing.get("status") == "superseded":
+            raise err(409, "commit_superseded",
+                      "write was truncated by a newer term's leader; "
+                      "retry with a new write_id",
+                      term=term, write_id=wid, first_seq=first, last_seq=last)
+        if existing.get("status") == "unstarted":
+            raise err(409, "write_unstarted",
+                      "write was registered but its record never reached disk; "
+                      "restart the append with this write_id",
+                      term=term, write_id=wid)
+        # pending：必须仍是当前任期主，记录仍在链上
+        if self.cluster.role != PRIMARY or self.cluster.term != term \
+                or not self.cluster.grant_valid():
+            raise err(409, "commit_superseded",
+                      "leadership changed before the write committed; "
+                      "the record stays pending and is not duplicated",
+                      term=term, current_term=self.cluster.term,
+                      write_id=wid, first_seq=first, last_seq=last,
+                      role=self.cluster.role)
+        self._advance_commit_locked()
+        result = self._committed_write_view(existing, replay=False) \
+            if self.commit.commit_index >= last else None
+        if result is not None:
+            return result
+        if not wait_commit:
+            return {"write_id": wid, "term": term, "seq": first,
+                    "first_seq": first, "last_seq": last,
+                    "committed": False, "status": "pending"}
+        rec = self._record_at(first) or {}
+        base = self._write_result(rec, wid, term, first, last) if rec else \
+            {"write_id": wid, "term": term, "seq": first,
+             "first_seq": first, "last_seq": last}
+        return self._await_commit(wid, term, first, last, base, timeout, transport)
+
+    def _write_result(self, rec: dict, wid: str, term: int,
+                      first: int, last: int) -> dict:
+        out = {
+            "write_id": wid,
+            "term": term,
+            "first_seq": first,
+            "last_seq": last,
+        }
+        if "seq" in rec:
+            out.update({
+                "seq": rec["seq"], "ts": rec.get("ts"), "type": rec.get("type"),
+                "payload": rec.get("payload"), "prev": rec.get("prev"),
+                "digest": rec.get("digest"),
+            })
+        return out
+
+    def _committed_write_view(self, entry: dict, replay: bool) -> dict:
+        first, last = int(entry["first_seq"]), int(entry["last_seq"])
+        rec = self._record_at(first) or {}
+        out = self._write_result(rec, entry["write_id"], int(entry["term"]), first, last)
+        out["committed"] = True
+        out["replay"] = replay
+        out["commit_index"] = self.commit.commit_index
+        return out
+
+    def _await_commit(self, wid: str, term: int, first: int, last: int,
+                      base_result: dict, timeout_ms: int,
+                      transport: Optional[Callable]) -> dict:
+        """释放 meta_lock 等待 [first..last] 整体进入提交水位。
+
+        被提交事件（成员 ack）广播唤醒后重新入锁复核；多数派恢复后由
+        ack 处理按原顺序推进待定记录，等待线程无需自行重试。
+        """
+        deadline = now_ms() + timeout_ms
+        while True:
+            with self.meta_lock:
+                self._advance_commit_locked()
+                if self.commit.commit_index >= last:
+                    out = dict(base_result)
+                    out.update({"committed": True,
+                                "commit_index": self.commit.commit_index})
+                    return out
+                if self.cluster.term != term or self.cluster.role != PRIMARY:
+                    raise err(409, "commit_superseded",
+                              "term changed while waiting for quorum commit",
+                              term=term, current_term=self.cluster.term,
+                              write_id=wid, first_seq=first, last_seq=last)
+                if not self.cluster.grant_valid():
+                    raise err(403, "grant_expired",
+                              "leadership grant expired before quorum commit",
+                              term=term, write_id=wid,
+                              first_seq=first, last_seq=last)
+                remaining = deadline - now_ms()
+                if remaining <= 0:
+                    raise err(504, "commit_timeout",
+                              "record persisted locally but not confirmed by a "
+                              "majority before the timeout; retry with the same "
+                              "write_id to continue the same commit",
+                              term=term, write_id=wid,
+                              first_seq=first, last_seq=last,
+                              commit_index=self.commit.commit_index)
+            with self._commit_cv:
+                self._commit_cv.wait(min(1.0, remaining / 1000))
+
+    # =====================================================================
+    # 多数派提交水位：成员确认推进、线性一致读屏障
+    # =====================================================================
+    #
+    # 主实例把「本任期各成员已确认的最长相同日志位置」收集起来；只有当
+    # 多数派确认的位置上是**当前任期**的记录时才推进 commit_index，并且
+    # 只在提议边界（普通写/原子批次/任期标记）上推进——原子批次绝不会在
+    # 提交水位两侧被拆开。旧任期的待定尾部因此必须等当前任期先提交一条
+    # 记录（上任时写入的 term_marker）后才随水位确认。
+
+    def _voter_ids(self) -> list[str]:
+        return list(self.cluster.s.voters)
+
+    def _quorum_size(self) -> int:
+        n = len(self.cluster.s.voters) or 1
+        return n // 2 + 1
+
+    def _advance_commit_locked(self) -> Optional[int]:
+        """依据当前多数派确认位置推进主实例提交水位，返回新水位（无推进 None）。
+
+        仅在主实例调用；备实例的水位由来源主在 ack 回执中告知。
+        """
+        if self.cluster.role != PRIMARY:
+            return None
+        term = self.cluster.term
+        n = len(self.cluster.s.voters) or 1
+        need = n // 2 + 1
+        tip_seq, _ = self.seglog.tip()
+        # 自己在当前任期已把记录持久化到 tip
+        matches = [tip_seq]
+        for nid in self.cluster.s.voters:
+            if nid == self.cluster.node_id:
+                continue
+            ack = self.commit.acks.get(nid)
+            if ack is None or int(ack.get("term", -1)) != term:
+                continue
+            seq = int(ack["match_seq"])
+            # 只承认「同一日志位置」：摘要必须与本地链一致（已压缩则信任边界）
+            if seq > tip_seq:
+                continue
+            d = self._digest_or_anchor(seq)
+            if d is None:
+                continue
+            if seq <= self.commit.commit_index or d == self._digest_or_anchor(seq):
+                matches.append(seq)
+        if len(matches) < need:
+            return None
+        matches.sort(reverse=True)
+        qseq = matches[need - 1]
+        if qseq <= self.commit.commit_index:
+            return None
+        # 当前任期规则：qseq 位置必须属于当前任期的提议
+        boundary = self._committable_boundary(term, qseq)
+        if boundary is None or boundary <= self.commit.commit_index:
+            return None
+        d = self._digest_or_anchor(boundary) or GENESIS
+        self._apply_commit_locked(boundary, term, d)
+        return boundary
+
+    def _committable_boundary(self, term: int, qseq: int) -> Optional[int]:
+        """返回 <= qseq 可提交的最大提议边界；须含一条当前任期提议。"""
+        boundary = self.commit.commit_index
+        saw_current_term = False
+        for p in self.commit.pending:
+            if p.first_seq > qseq:
+                break
+            if p.last_seq > qseq:
+                break  # qseq 落在提议内部（原子批次中间）：水位不能越过
+            boundary = p.last_seq
+            if p.term == term:
+                saw_current_term = True
+        return boundary if saw_current_term else None
+
+    def _apply_commit_locked(self, seq: int, term: int, digest: str) -> None:
+        if not self.commit.set_commit(seq, term, digest):
+            return
+        committed = self.commit.drop_committed()
+        for p in committed:
+            if p.write_id:
+                self.commit.mark_write_committed(p.write_id)
+        self.commit.persist()
+        # 唤醒等待提交的写线程
+        with self._commit_cv:
+            self._commit_cv.notify_all()
+
+    def handle_ack(self, node_id: str, term: int, match_seq: int,
+                   commit_seq: int, barrier: bool = False,
+                   commit_digest: Optional[str] = None) -> dict:
+        """RPC：投票成员向主实例报告确认位置；也承担读屏障心跳。
+
+        - 备实例见到更高任期：前滚本地任期（但角色不变）；
+        - 主实例收到更高任期：授权失效、降为备，明确拒绝；
+        - barrier=True 时不更新复制匹配进度（仅作为读屏障心跳）。
+        """
+        with self.meta_lock:
+            if term < self.cluster.term:
+                return {"term": self.cluster.term, "ack": False,
+                        "role": self.cluster.role,
+                        "reason": "stale_term"}
+            if term > self.cluster.term:
+                if self.cluster.role == PRIMARY:
+                    self.cluster.bump_term(term)
+                    with self._commit_cv:
+                        self._commit_cv.notify_all()
+                    return {"term": self.cluster.term, "ack": False,
+                            "role": STANDBY, "reason": "term_changed"}
+                self.cluster.bump_term(term)
+            if self.cluster.role != PRIMARY:
+                # 读屏障心跳：备实例也可以确认「我见过该任期」，候选主据此
+                # 证明自己仍是多数派认可的主（follower 不再支持更高任期者）。
+                if barrier:
+                    return {"term": self.cluster.term, "ack": True,
+                            "role": STANDBY, "primary": self.replica.peer_url,
+                            "commit_index": self.commit.commit_index}
+                return {"term": self.cluster.term, "ack": False,
+                        "role": STANDBY,
+                        "primary": self.replica.peer_url,
+                        "reason": "not_primary"}
+            match_seq = int(match_seq)
+            if not barrier:
+                # 同一位置摘要必须一致才计入（防止不同历史被当作确认）
+                tip_seq, _ = self.seglog.tip()
+                d = self._digest_or_anchor(match_seq) if match_seq <= tip_seq else None
+                if match_seq > 0 and d is None:
+                    return {"term": self.cluster.term, "ack": False,
+                            "role": PRIMARY, "reason": "unknown_position",
+                            "commit_index": self.commit.commit_index}
+                if match_seq > self.commit.commit_index and d is not None \
+                        and commit_digest and d != commit_digest:
+                    # 该位置历史与主不一致：绝不据此推进提交水位
+                    return {"term": self.cluster.term, "ack": False,
+                            "role": PRIMARY, "reason": "divergent_position",
+                            "commit_index": self.commit.commit_index,
+                            "match_seq": match_seq}
+                self.commit.record_ack(node_id, term, match_seq, int(commit_seq))
+                self.commit.persist()
+                self._advance_commit_locked()
+            return {"term": self.cluster.term, "ack": True, "role": PRIMARY,
+                    "commit_index": self.commit.commit_index,
+                    "tip_seq": self.seglog.tip()[0]}
+
+    def _follower_ack_primary(self, transport: Optional[Callable] = None) -> None:
+        """备实例：把本地已确认位置报告给主实例（复制推进后调用）。"""
+        peer = self.replica.peer_url
+        if not peer:
+            return
+        from .replication import PATH_ACK
+
+        transport = transport or self._http
+        try:
+            _st, resp = transport("POST", peer + PATH_ACK, {
+                "node_id": self.cluster.node_id,
+                "term": self.cluster.term,
+                "match_seq": self.replica.synced_seq,
+                "commit_seq": self.replica.synced_seq,
+                "commit_digest": self.replica.synced_digest,
+            })
+            if int(resp.get("term", self.cluster.term)) > self.cluster.term:
+                self.cluster.bump_term(int(resp["term"]))
+            # 主在回执里给出它的提交水位：备实例只跟随，绝不自己越过
+            leader_commit = int(resp.get("commit_index", -1))
+            if resp.get("ack") and leader_commit >= 0:
+                self._follower_advance_commit(leader_commit)
+        except Error:
+            pass
+        except Exception:
+            pass
+
+    # ---------- 主实例主动推送（新主对旧主/未拉取成员） ----------
+
+    def leader_push_once(self, peer_url: str,
+                         transport: Optional[Callable] = None) -> dict:
+        """主实例把提交水位之后的记录主动推给一个跟随成员，并收集其确认。
+
+        故障切换后旧主不会自动改去拉取新主，因此主必须能主动推送。
+        推送是标准复制页的逆方向：备端走与拉取完全相同的校验/应用路径。
+        """
+        from .replication import PATH_APPEND, PATH_PROGRESS
+
+        transport = transport or self._http
+        with self.meta_lock:
+            if self.cluster.role != PRIMARY:
+                return {"skipped": "not_primary"}
+            term = self.cluster.term
+            tip_seq, _ = self.seglog.tip()
+            nid = self._peer_node(peer_url)
+            ack = self.commit.acks.get(nid)
+            match = int(ack["match_seq"]) if ack else None
+            pointer = self.checkpoints.current
+        # 未知成员（典型：故障切换后的旧主）：先探测其同步进度/链尖，
+        # 与本地历史一致则直接当作已确认位置，随后推送缺失尾部。
+        probe_applied = 0
+        if match is None:
+            try:
+                _st, prog = transport("GET", peer_url + PATH_PROGRESS)
+                if int(prog.get("term", term)) > term:
+                    with self.meta_lock:
+                        self.cluster.bump_term(int(prog["term"]))
+                    return {"pushed": False, "reason": "term_changed"}
+                ftip = int(prog.get("tip_seq", 0))
+                with self.meta_lock:
+                    if ftip > 0 and self._digest_or_anchor(ftip) == prog.get("tip_digest"):
+                        # 链尖与本地一致：把它登记到链尖（多数派可证）
+                        match = ftip
+                        self.commit.record_ack(
+                            str(prog.get("node_id") or nid), term, match,
+                            int(prog.get("commit_index", 0)))
+                        self.commit.persist()
+                        self._advance_commit_locked()
+                    else:
+                        match = min(int(prog.get("commit_index", 0)),
+                                    self.commit.commit_index)
+            except Error as e:
+                return {"pushed": False, "error": e.code}
+            except Exception as e:
+                return {"pushed": False, "error": getattr(e, "code", "unreachable")}
+        start = max(1, match + 1)
+        readable_from = pointer["seq"] + 1 if pointer else 1
+        try:
+            if start < readable_from or (pointer is not None and match < pointer["seq"]):
+                # 跟随者落后到需要快照：交给它自己的拉取周期/人工处理，
+                # 主动推送只覆盖增量尾部。
+                return {"skipped": "snapshot_required", "match_seq": match}
+            if start > tip_seq:
+                return {"pushed": True, "sent": 0, "match_seq": match,
+                        "commit_index": self.commit.commit_index}
+            page = self.export_records(start, self.cfg.replication_batch, term)
+            _st, resp = transport("POST", peer_url + PATH_APPEND, page)
+            if int(resp.get("term", term)) > term:
+                with self.meta_lock:
+                    self.cluster.bump_term(int(resp["term"]))
+                return {"pushed": False, "reason": "term_changed"}
+            with self.meta_lock:
+                follower_match = int(resp.get("match_seq", tip_seq)) if resp.get("success") else match
+            # 跟随者确认后，主可能推进了自己的提交水位；再发一条空心跳，
+            # 把新的 commit_index 告知跟随者（否则它停在推送页的旧水位）。
+            if resp.get("success"):
+                with self.meta_lock:
+                    nid = resp.get("node_id") or self._peer_node(peer_url)
+                    self.commit.record_ack(
+                        nid, term, follower_match,
+                        int(resp.get("commit_seq", self.commit.commit_index)))
+                    self.commit.persist()
+                    self._advance_commit_locked()
+                    heartbeat = {
+                        "term": self.cluster.term,
+                        "from": follower_match + 1,
+                        "tip_seq": self.seglog.tip()[0],
+                        "records": [],
+                        "commit_index": self.commit.commit_index,
+                        "commit_digest": self.commit.commit_digest,
+                        "pending": [p.to_dict() for p in self.commit.pending],
+                        "term_markers": self.commit.term_marker_view(),
+                    }
+                try:
+                    transport("POST", peer_url + PATH_APPEND, heartbeat)
+                except Exception:
+                    pass
+            with self.meta_lock:
+                return {"pushed": bool(resp.get("success")),
+                        "sent": len(page.get("records", [])),
+                        "match_seq": follower_match,
+                        "commit_index": self.commit.commit_index}
+        except Error as e:
+            return {"pushed": False, "error": e.code}
+        except Exception as e:
+            return {"pushed": False, "error": getattr(e, "code", "transport_error")}
+
+    def _peer_node(self, peer_url: str) -> str:
+        for nid, url in self.cfg.peers.items():
+            if url.rstrip("/") == peer_url.rstrip("/"):
+                return nid
+        return peer_url
+
+    def handle_progress(self) -> dict:
+        """RPC（备端）：向主汇报当前同步进度/链尖（供主主动推送定位）。"""
+        with self.meta_lock:
+            tip_seq, tip_digest = self.seglog.tip()
             return {
-                "seq": rec["seq"],
-                "ts": rec["ts"],
-                "type": rec["type"],
-                "payload": rec["payload"],
-                "prev": rec["prev"],
-                "digest": rec["digest"],
+                "term": self.cluster.term,
+                "role": self.cluster.role,
+                "node_id": self.cluster.node_id,
+                "synced_seq": self.replica.synced_seq,
+                "synced_digest": self.replica.synced_digest,
+                "commit_index": self.commit.commit_index,
+                "tip_seq": tip_seq,
+                "tip_digest": tip_digest,
             }
+
+    def handle_append_entries(self, page: dict) -> dict:
+        """RPC（备端）：主主动推送的复制页，走与拉取相同的 apply_records。"""
+        with self.meta_lock:
+            term = int(page.get("term", 0))
+            if term < self.cluster.term:
+                return {"success": False, "term": self.cluster.term,
+                        "reason": "stale_term"}
+            if term > self.cluster.term:
+                self.cluster.bump_term(term)
+            if self.cluster.role == PRIMARY and self.cluster.grant_valid():
+                return {"success": False, "term": self.cluster.term,
+                        "reason": "leader_valid"}
+            # 推送页与拉取页同构：顺序/摘要链/冲突逻辑完全一致
+            try:
+                before = self.replica.synced_seq
+                # 先合并主的提议归属与提交水位（不回拉 ack：确认由响应返回）
+                self._merge_primary_meta(page)
+                self.apply_records(page, ack_back=False)
+                leader_commit = int(page.get("commit_index", self.commit.commit_index))
+                if leader_commit > self.commit.commit_index:
+                    self._follower_advance_commit(leader_commit)
+                return {"success": True, "term": self.cluster.term,
+                        "node_id": self.cluster.node_id,
+                        "match_seq": self.replica.synced_seq,
+                        "commit_seq": self.commit.commit_index,
+                        "applied": self.replica.synced_seq - before}
+            except Error as e:
+                return {"success": False, "term": self.cluster.term,
+                        "reason": e.code, "details": e.details}
+
+    def _follower_advance_commit(self, leader_commit: int) -> None:
+        """备实例推进提交水位：只到本地已同步位置、不跨越已知批次边界。
+
+        主实例的提交水位是权威的（它只会在提议边界推进）；备实例只在
+        本地待定提议表**明确知道**某个原子批次跨越目标位置时才停在该
+        批次之前。提议表为空/未覆盖目标（边界来自快照安装、归属信息已
+        压缩）时信任主实例，直接推进到 min(leader_commit, synced)。
+        """
+        cs = self.commit
+        target = min(leader_commit, self.replica.synced_seq)
+        if target <= cs.commit_index:
+            return
+        boundary = target
+        for p in cs.pending:
+            # 目标严格落在已知原子批次内部才停在它之前；
+            # target == last_seq 即整批边界，可直接提交。
+            if p.kind == "batch" and p.first_seq <= target < p.last_seq:
+                boundary = p.first_seq - 1
+                break
+        if boundary > cs.commit_index:
+            d = self._digest_or_anchor(boundary) or GENESIS
+            self._apply_commit_locked(boundary, self.cluster.term, d)
+
+    def linearizable_read(self, timeout_ms: Optional[int] = None,
+                          transport: Optional[Callable] = None) -> dict:
+        """线性一致读：当前主在当前任期向多数成员完成一次读屏障后返回。
+
+        读屏障 = 当前任期心跳被多数派确认（ReadIndex 语义）：
+        - 失去多数派 / 授权过期 / 等待期间发生任期变化 -> 明确拒绝；
+        - 备实例拒绝并返回当前角色、任期与已知主实例。
+        返回的状态只包含不超过提交水位的内容。
+        """
+        with self.meta_lock:
+            if self.cluster.role != PRIMARY:
+                raise err(403, "not_primary",
+                          "linearizable reads are served by the primary only",
+                          role=self.cluster.role, term=self.cluster.term,
+                          primary=self.replica.peer_url)
+            if not self.cluster.grant_valid():
+                raise err(403, "grant_expired",
+                          "leadership grant expired; cannot prove leadership",
+                          term=self.cluster.term)
+            term = self.cluster.term
+            timeout = self._clamp_commit_timeout(
+                timeout_ms, self.cfg.read_barrier_timeout_ms)
+        if not self._read_barrier(term, timeout, transport):
+            with self.meta_lock:
+                cur_term = self.cluster.term
+                role = self.cluster.role
+            if cur_term != term or role != PRIMARY:
+                raise err(409, "term_changed",
+                          "term or leadership changed during the read barrier",
+                          term=term, current_term=cur_term)
+            raise err(504, "read_barrier_timeout",
+                      "majority did not acknowledge this term before timeout",
+                      term=term)
+        # 屏障成功后再次复核：任期未变化且仍是主，才返回提交水位内的状态
+        with self.meta_lock:
+            if self.cluster.term != term or self.cluster.role != PRIMARY:
+                raise err(409, "term_changed",
+                          "term changed after the read barrier",
+                          term=term, current_term=self.cluster.term)
+            if not self.cluster.grant_valid():
+                raise err(403, "grant_expired", "grant expired during the read",
+                          term=term)
+            return self._committed_state_view(term, barrier=True)
+
+    def _read_barrier(self, term: int, timeout_ms: int,
+                      transport: Optional[Callable]) -> bool:
+        """当前任期心跳拿到多数派确认（含自己一票）。"""
+        from .replication import PATH_ACK
+
+        transport = transport or self._http
+        peers = [(nid, u.rstrip("/")) for nid, u in self.cfg.peers.items()
+                 if nid != self.cluster.node_id]
+        need = (len(self.cluster.s.voters) or 1) // 2 + 1
+        deadline = now_ms() + timeout_ms
+        # 单节点：自足多数派
+        if not peers:
+            with self.meta_lock:
+                return self.cluster.term == term and self.cluster.role == PRIMARY
+        acks = 1
+        newer_term = False
+        lock = threading.Lock()
+
+        def probe(url: str) -> None:
+            nonlocal acks, newer_term
+            try:
+                _st, resp = transport("POST", url + PATH_ACK, {
+                    "node_id": self.cluster.node_id, "term": term,
+                    "barrier": True})
+                if resp.get("ack"):
+                    with lock:
+                        acks += 1
+                elif int(resp.get("term", term)) > term:
+                    newer_term = True
+                    with self.meta_lock:
+                        self.cluster.bump_term(int(resp["term"]))
+            except Exception:
+                pass
+
+        threads = [threading.Thread(target=probe, args=(url,), daemon=True)
+                   for _nid, url in peers]
+        for t in threads:
+            t.start()
+        for t in threads:
+            remaining = max(0.05, (deadline - now_ms()) / 1000)
+            t.join(remaining)
+        if newer_term:
+            return False
+        return acks >= need
+
 
     # =====================================================================
     # 原子批次（幂等键）
@@ -465,24 +1239,36 @@ class Kernel:
             self.batches.add_ops(b, normed)
             return self._batch_view(b, include_ops=True)
 
-    def commit_batch(self, batch_id: str) -> dict:
-        """提交批次：整批记录按加入顺序一次性入链；幂等键保证重试安全。
+    def commit_batch(self, batch_id: str, write_id: Optional[str] = None,
+                     timeout_ms: Optional[int] = None, wait_commit: bool = True,
+                     transport: Optional[Callable] = None) -> dict:
+        """提交批次：整批记录按加入顺序一次性入链并等待多数派确认。
 
         - 同批次/同幂等键重复提交相同内容 -> 返回首次提交结果（不重复入链）；
         - 同幂等键不同内容 -> 409 idempotency_conflict；
-        - 并发提交由 meta_lock 串行化，只有一个真正入链，其余拿到重放结果。
+        - 并发提交由 meta_lock 串行化，只有一个真正入链，其余拿到重放结果；
+        - 整批共享一个 write_id：提交水位只会越过整批边界，批次绝不会在
+          水位两侧被拆开；多数派确认超时返回 504 commit_timeout，相同
+          write_id（或同批次 id）重试继续同一提交过程，不追加重复记录。
         """
+        timeout = self._clamp_commit_timeout(timeout_ms)
         with self.meta_lock:
             self._require_writable_primary()
+            term = self.cluster.term
             b = self._require_batch(batch_id)
             if b.status == COMMITTED:
-                # 同批次重复提交：返回首次结果，不重复入链
-                return self._batch_result(b, replay=True)
+                last_seq = b.last_seq or 0
+                if self.commit.commit_index >= last_seq:
+                    # 同批次重复提交且已越提交水位：返回首次结果，不重复入链
+                    return self._batch_result(b, replay=True, committed=True)
+                # 批次状态已落 committed 但水位未到（重启后续等多数派）：
+                # 继续同一提交过程。
+                wid = self._validate_write_id(write_id or b.write_id)
+                return self._continue_batch_locked(
+                    b, wid, term, b.first_seq, b.last_seq,
+                    timeout, wait_commit, transport)
             if b.status == ABORTED:
                 raise err(409, "batch_aborted", "batch was aborted; cannot commit")
-            if b.status == COMMITTING:
-                # 正常流程不可达（启动恢复已清算）；防御性拒绝
-                raise err(409, "batch_committing", "batch commit already in progress")
             if b.effective_status(now_ms()) == EXPIRED:
                 raise err(410, "batch_expired", "batch expired; cannot commit")
             if not b.ops:
@@ -491,50 +1277,191 @@ class Kernel:
             key = b.registry_key()
             entry = self.batches.commit_entry(key)
             if entry is not None:
-                if entry["content_hash"] == content_hash:
-                    # 同一幂等键相同内容：整批不重发，返回首次提交结果
-                    self.batches.mark_committed(b, entry, replay=True)
-                    return self._batch_result(b, replay=True)
-                raise err(409, "idempotency_conflict",
-                          "idempotency key already committed with different content",
-                          idempotency_key=b.idempotency_key,
-                          first_batch_id=entry["batch_id"],
-                          first_seq=entry["first_seq"], last_seq=entry["last_seq"])
-            # 新鲜提交：committing 落盘 -> 整批入链 -> 幂等登记（提交点）-> 状态落盘
+                if entry["content_hash"] != content_hash:
+                    raise err(409, "idempotency_conflict",
+                              "idempotency key already committed with different content",
+                              idempotency_key=b.idempotency_key,
+                              first_batch_id=entry["batch_id"],
+                              first_seq=entry["first_seq"], last_seq=entry["last_seq"])
+                wid = self._validate_write_id(write_id or b.write_id)
+                last_seq = int(entry["last_seq"])
+                # 是否「另一个批次」复用同一幂等键（真正的跨批次重放）：
+                # 同一批次在多数确认超时后的重试不算 replay。
+                cross_batch = entry.get("batch_id") not in (None, b.batch_id)
+                replay = cross_batch
+                if b.status != COMMITTED:
+                    # 幂等登记已落盘但本批次对象尚未标记 committed（典型：
+                    # 上一调用本地提交点已过但多数确认超时，或重启后补记）。
+                    first_seq = int(entry["first_seq"])
+                    if self.commit.commit_index >= last_seq:
+                        self.batches.mark_committed(b, entry, replay=replay)
+                        return self._batch_result(b, replay=replay, committed=True)
+                    return self._continue_batch_locked(
+                        b, wid, term, first_seq, last_seq,
+                        timeout, wait_commit, transport, replay=replay)
+                if self.commit.commit_index >= last_seq:
+                    # 同一幂等键相同内容且已越提交水位：返回首次提交结果
+                    return self._batch_result(b, replay=True, committed=True)
+                # 已登记但未越水位：继续等待同一提交过程
+                return self._continue_batch_locked(
+                    b, wid, term, int(entry["first_seq"]), last_seq,
+                    timeout, wait_commit, transport, replay=True)
+            wid = self._validate_write_id(write_id or b.write_id)
+            if b.status == COMMITTING:
+                # 多数派确认期间客户端重试（含进程重启后本地已整批持久化）：
+                # 继续等待同一 write_id 的同一提交过程，绝不追加记录。
+                if b.write_id and b.write_id != wid:
+                    raise err(409, "write_id_conflict",
+                              "batch is already committing under another write_id",
+                              batch_id=b.batch_id, write_id=b.write_id)
+                first_seq = b.first_seq
+                last_seq = b.last_seq
+                return self._continue_batch_locked(
+                    b, wid, term, first_seq, last_seq, timeout, wait_commit,
+                    transport, replay=False)
+            # 同 write_id 已用于另一提交：明确冲突，不允许混用
+            existing = self.commit.get_write(wid)
+            if existing is not None and existing.get("kind") == "write":
+                raise err(409, "write_id_conflict",
+                          "write_id already used by a different write",
+                          write_id=wid)
+            # 新鲜提交：committing 落盘 -> 整批入链 -> 幂等登记 -> 等多数派
             first_seq = self.seglog.next_seq
-            self.batches.mark_committing(b, first_seq, content_hash)
+            b.write_id = wid
+            self.batches.mark_committing(b, first_seq, content_hash, wid)
             self._crash_hook("batch_after_mark")
             try:
-                last_seq = first_seq - 1
                 for op in b.ops:
-                    last_seq = self.append(op["type"], op["payload"])["seq"]
+                    # 直接本地追加：批量提交在锁内串行，等待多数派在锁外
+                    Reducer().apply(op["type"], op["payload"])
+                    self._append_record_locked(op["type"], op["payload"])
+                last_seq = first_seq + len(b.ops) - 1
             except Exception:
                 # 运行期失败同样整批回滚，不留半批
                 self._rollback_uncommitted(b, first_seq)
                 raise
             self._crash_hook("batch_after_append")
-            entry = {
+            self.commit.register_write(wid, term, first_seq, last_seq,
+                                       kind="batch", batch_id=b.batch_id)
+            self.commit.add_proposal(Proposal(
+                first_seq, last_seq, term=term, kind="batch",
+                write_id=wid, batch_id=b.batch_id))
+            self.commit.persist()
+            self._advance_commit_locked()
+            return self._continue_batch_locked(
+                b, wid, term, first_seq, last_seq, timeout, wait_commit,
+                transport, replay=False)
+
+    def _continue_batch_locked(self, b: Batch, wid: str, term: int,
+                               first_seq: int, last_seq: Optional[int],
+                               timeout: int, wait_commit: bool,
+                               transport: Optional[Callable],
+                               replay: bool = False) -> dict:
+        """本地记录已就位后：登记提交点（一旦多数确认即可见）并等待水位。
+
+        replay=True 表示同一幂等键的另一次提交在复用首次序号区间，
+        提交结果返回 replay=True，但首次提交结果不变。
+        """
+        last_seq = last_seq if last_seq is not None else b.last_seq
+        content_hash = b.content_hash
+        key = b.registry_key()
+        if self.batches.commit_entry(key) is None:
+            reg = {
                 "key": key,
                 "batch_id": b.batch_id,
                 "content_hash": content_hash,
                 "first_seq": first_seq,
                 "last_seq": last_seq,
-                "record_count": last_seq - first_seq + 1,
+                "record_count": (last_seq - first_seq + 1) if last_seq else 0,
                 "committed_ts": now_ms(),
             }
-            self.batches.register_commit(key, entry)  # —— 唯一提交点
+            self.batches.register_commit(key, reg)  # 幂等登记（本地提交点）
             self._crash_hook("batch_after_register")
-            self.batches.mark_committed(b, entry, replay=False)
-            return self._batch_result(b, replay=False)
+        if self.commit.commit_index >= (last_seq or 0):
+            entry = self.batches.commit_entry(key)
+            self.batches.mark_committed(b, entry, replay=replay)
+            return self._batch_result(b, replay=replay, committed=True)
+        if not wait_commit:
+            return self._batch_pending(b, wid)
+        # 锁外等待多数派推进提交水位（批记录保持提交前不可见语义）
+        deadline = now_ms() + timeout
+        while True:
+            with self.meta_lock:
+                self._advance_commit_locked()
+                if self.commit.commit_index >= (last_seq or 0):
+                    entry = self.batches.commit_entry(key)
+                    self.batches.mark_committed(b, entry, replay=replay)
+                    return self._batch_result(b, replay=replay, committed=True)
+                if self.cluster.term != term or self.cluster.role != PRIMARY:
+                    raise err(409, "commit_superseded",
+                              "term changed while waiting for the batch commit; "
+                              "retry with the same write_id to continue",
+                              term=term, current_term=self.cluster.term,
+                              write_id=wid, first_seq=first_seq, last_seq=last_seq)
+                if not self.cluster.grant_valid():
+                    raise err(403, "grant_expired",
+                              "grant expired before the batch reached quorum",
+                              term=term, write_id=wid,
+                              first_seq=first_seq, last_seq=last_seq)
+                remaining = deadline - now_ms()
+                if remaining <= 0:
+                    raise err(504, "commit_timeout",
+                              "batch persisted locally but not confirmed by a "
+                              "majority before the timeout; retry with the same "
+                              "write_id to continue the same commit",
+                              term=term, write_id=wid,
+                              first_seq=first_seq, last_seq=last_seq,
+                              commit_index=self.commit.commit_index)
+            with self._commit_cv:
+                self._commit_cv.wait(min(1.0, remaining / 1000))
+
+    def _batch_pending(self, b: Batch, wid: str) -> dict:
+        return {
+            "batch_id": b.batch_id, "idempotency_key": b.idempotency_key,
+            "status": "committing", "replay": False,
+            "write_id": wid, "first_seq": b.first_seq, "last_seq": b.last_seq,
+            "record_count": b.record_count, "committed": False,
+        }
+
+    def _truncate_tail_chain(self, keep_seq: int, anchor: Optional[str] = None) -> None:
+        """截断链尾到 keep_seq，并把提交水位/待定提议/write 登记一起回退。
+
+        提交水位绝不可以指向已不存在的记录；被截断的本地未提交写入（批次
+        回滚等）保持其 write_id 登记但序号区间不再有效，重试会追加新记录。
+        """
+        if self.seglog.tip()[0] > keep_seq:
+            self.seglog.truncate_tail(keep_seq)
+            self._sync_tip(anchor if anchor is not None else
+                           (self.checkpoints.current["tail_anchor"]
+                            if self.checkpoints.current else GENESIS))
+            self._persist_head()
+        if self.commit.commit_index > keep_seq:
+            self.commit.commit_index = keep_seq
+            self.commit.commit_digest = self._digest_or_anchor(keep_seq) or GENESIS
+        for wid, e in self.commit.writes.items():
+            if e.get("status") == "pending" and int(e["first_seq"]) > keep_seq:
+                self.commit.mark_write_superseded(wid, self.cluster.term)
+        self.commit.prune_pending_through(keep_seq)
+        self.commit.persist()
 
     def _rollback_uncommitted(self, b: Batch, first_seq: int) -> None:
-        """整批回滚：截断链尾到批次之前，校准链尖与链头锚点，批次回到 open。"""
+        """整批回滚：截断链尾到批次之前，校准链尖与链头锚点，批次回到 open。
+
+        批次记录尚未取得多数确认（整批原子，水位不会落在批次内部），
+        提交水位无需调整；write 登记标记为已取代。
+        """
         keep = first_seq - 1
         if self.seglog.tip()[0] > keep:
             self.seglog.truncate_tail(keep)
             pointer = self.checkpoints.current
             self._sync_tip(pointer["tail_anchor"] if pointer else GENESIS)
             self._persist_head()
+        if b.write_id:
+            e = self.commit.get_write(b.write_id)
+            if e is not None and e.get("status") == "pending":
+                self.commit.mark_write_superseded(b.write_id, self.cluster.term)
+        self.commit.prune_pending_through(keep)
+        self.commit.persist()
         self.batches.rollback_to_open(b)
 
     def abort_batch(self, batch_id: str) -> dict:
@@ -584,8 +1511,9 @@ class Kernel:
             v["ops"] = b.ops
         return v
 
-    def _batch_result(self, b: Batch, replay: bool) -> dict:
-        return {
+    def _batch_result(self, b: Batch, replay: bool,
+                      committed: Optional[bool] = None) -> dict:
+        out = {
             "batch_id": b.batch_id,
             "idempotency_key": b.idempotency_key,
             "status": "committed",
@@ -596,6 +1524,11 @@ class Kernel:
             "content_hash": b.content_hash,
             "committed_ts": b.committed_ts,
         }
+        if committed is not None:
+            out["committed"] = committed
+            if committed:
+                out["commit_index"] = self.commit.commit_index
+        return out
 
     # =====================================================================
     # 租约 / 钉位
@@ -715,13 +1648,20 @@ class Kernel:
                 self._compact_active = False
 
     def _candidate_segments(self) -> tuple[Optional[int], list[int]]:
-        """返回（受保护最老段, 可回收 sealed 段列表）。"""
+        """返回（受保护最老段, 可回收 sealed 段列表）。
+
+        除读者钉位外，段的最后一条记录必须已进入提交水位：绝不压缩
+        尚未取得多数派确认的待定记录（含旧主半提交尾部）。
+        """
         oldest = self.readers.oldest_pin()
         protected = self.seglog.segment_for_pin(oldest) if oldest is not None else None
+        commit_seq = self.commit.commit_index
         cands = []
         for seg_id, meta in sorted(self.seglog.segments.items()):
             if not meta.sealed:
                 continue
+            if meta.last_seq > commit_seq:
+                continue  # 段内含待定记录：绝不回收
             if protected is None or seg_id < protected:
                 cands.append(seg_id)
         return protected, cands
@@ -1045,6 +1985,8 @@ class Kernel:
                 "term": self.cluster.term,
                 "tip_seq": tip_seq,
                 "tip_digest": tip_digest,
+                "commit_index": self.commit.commit_index,
+                "commit_digest": self.commit.commit_digest,
                 "checkpoint": (
                     None if pointer is None else
                     {"gen": pointer["gen"], "seq": pointer["seq"],
@@ -1076,6 +2018,12 @@ class Kernel:
                 "from": from_seq,
                 "tip_seq": tip_seq,
                 "tip_digest": tip_digest,
+                "commit_index": self.commit.commit_index,
+                "commit_digest": self.commit.commit_digest,
+                # 主实例的待定提议表（含任期标记）：备实例据此知道提交水位
+                # 只能在哪些边界推进，原子批次不会被水位拆成两半。
+                "pending": [p.to_dict() for p in self.commit.pending],
+                "term_markers": self.commit.term_marker_view(),
                 "records": recs,
                 "next": recs[-1]["seq"] + 1 if recs else from_seq,
             }
@@ -1102,6 +2050,12 @@ class Kernel:
                 "manifest": man_doc,
                 "tip_seq": tip_seq,
                 "tip_digest": tip_digest,
+                # 快照边界可能已经越过来源提交水位之前；备实例安装后从
+                # min(边界, 来源水位) 起步，任期标记位置一并携带。
+                "commit_index": self.commit.commit_index,
+                "commit_digest": self.commit.commit_digest,
+                "term_markers": self.commit.term_marker_view(),
+                "pending": [p.to_dict() for p in self.commit.pending],
             }
 
     # ---------- 备实例：复制控制 ----------
@@ -1205,6 +2159,8 @@ class Kernel:
                         "GET", peer + PATH_SNAPSHOT, qs={"gen": cp["gen"], "term": term})
                     self.install_snapshot(snap, replace_local=(rep_synced <= cp["seq"]))
                     installed = True
+                    # 快照安装后立即把确认位置回报给主（推动多数派提交）
+                    self._follower_ack_primary(transport)
 
                 start = self.replica.synced_seq + 1
                 try:
@@ -1220,12 +2176,13 @@ class Kernel:
                     raise
                 if int(page.get("term", term)) < self.cluster.term:
                     raise err(409, "stale_term", "records page came from an older term")
-                applied = self.apply_records(page)
+                applied = self.apply_records(page, transport=transport)
                 new_status = (CAUGHT_UP if self.replica.synced_seq >= bnd["tip_seq"]
                               else SYNCING)
                 self.replica.set_status(new_status)
                 return {"installed_snapshot": installed,
                         "applied": applied,
+                        "commit_index": self.commit.commit_index,
                         "synced_seq": self.replica.synced_seq,
                         "status": new_status}
             except Error as e:
@@ -1267,19 +2224,25 @@ class Kernel:
         except Exception:
             return False
 
-    def apply_records(self, page: dict) -> int:
+    def apply_records(self, page: dict,
+                      transport: Optional[Callable] = None,
+                      ack_back: bool = True) -> int:
         """顺序、去重、摘要链校验地应用一页来源记录。
 
         - seq <= synced 的重复段：逐条与本地摘要比对，相同跳过（不重复应用），
           不同即冲突；
         - seq > synced：必须 seq == synced+1 且 prev 衔接、重算摘要一致，
           否则停在 replication_conflict，绝不静默覆盖。
+        ack_back=False 用于主主动推送：确认位置通过 RPC 响应返回，不再回拉 ack。
         """
         recs = page.get("records", [])
         if not recs:
             if self.replica.synced_seq < int(page.get("tip_seq", self.replica.synced_seq)):
                 # 来源有更新但拿不到下一条（已压缩）：下轮装快照，不算冲突
                 return 0
+            # 没有新记录：仍跟随来源提交水位（可能全部是旧页重放）
+            self._follower_follow_page(page, applied=0,
+                                       transport=transport)
             return 0
         applied = 0
         skipped = 0
@@ -1295,6 +2258,7 @@ class Kernel:
                 # 必须与已确认历史逐条一致才允许跳过
                 local = self._digest_at(seq)
                 if local is not None and local != rd:
+                    # 已确认历史分叉：冲突冻结（绝不静默覆盖已确认位置）
                     self._raise_conflict(seq, local, rd, "duplicate segment diverges")
                 if local is None and seq > 0:
                     # 已确认位置之前却没有记录（压缩空洞）：以边界凭证为准，跳过
@@ -1302,10 +2266,21 @@ class Kernel:
                 skipped += 1
                 continue
             if seq != expect_seq:
+                # 空洞（本地有未提交分叉、来源从更早位置给页）：安全裁剪后重试
+                if self._trim_uncommitted_prefix(r):
+                    self._follower_follow_page(page, applied=0, imported=False,
+                                               transport=transport)
+                    return self.apply_records(page, transport=transport, ack_back=ack_back)
                 self._raise_conflict(
                     seq, None, rd,
                     "source seq is not contiguous with confirmed position")
             if r.get("prev") != expect_anchor:
+                # 本地未提交尾部与来源分叉：裁掉到提交水位之间的本地后缀，
+                # 只要匹配点仍在提交水位之后即可安全续接，不冻结复制。
+                if self._trim_uncommitted_prefix(r):
+                    self._follower_follow_page(page, applied=0, imported=False,
+                                               transport=transport)
+                    return self.apply_records(page, transport=transport, ack_back=ack_back)
                 self._raise_conflict(seq, expect_anchor, r.get("prev"),
                                      "prev anchor diverges")
             if rd != r.get("digest"):
@@ -1337,7 +2312,68 @@ class Kernel:
             # 崩溃重启从该位置继续，重复数据不会重复应用。
             self.replica.advance(int(last["seq"]), record_digest(last))
             applied = len(new_records)
+        self._follower_follow_page(page, applied=applied,
+                                       transport=transport if ack_back else None)
         return applied
+
+    def _trim_uncommitted_prefix(self, incoming: dict) -> bool:
+        """备实例本地未提交尾部与来源分叉时，安全裁剪到共同前缀。
+
+        只允许裁掉严格高于本地提交水位（commit_index）的本地后缀；
+        共同前缀由来源记录的 prev 摘要在本地链上定位。任何裁剪触及
+        已提交记录都返回 False（调用方进入冲突冻结）。
+        """
+        seq = int(incoming["seq"])
+        want_prev = incoming.get("prev")
+        commit_seq = self.commit.commit_index
+        # 来源记录序号不能落在已提交水位之内（那种分叉必须冻结）
+        if seq <= commit_seq:
+            return False
+        anchor_seq = seq - 1
+        local_anchor = self._digest_or_anchor(anchor_seq)
+        if local_anchor is None or want_prev != local_anchor:
+            # 来源 prev 在本地链上找不到一致位置：裁到提交水位，交给外层重拉
+            target = commit_seq
+        else:
+            target = anchor_seq
+        if target < commit_seq:
+            return False
+        # 同步游标从未前滚（旧主刚交接，synced=0）但本地链与来源一致：
+        # 不截断，只把确认位置前滚到共同前缀。
+        if target == self.seglog.tip()[0] and self.replica.synced_seq == 0:
+            d = self._digest_or_anchor(target) or GENESIS
+            self.replica.advance(target, d, status=SYNCING)
+            return True
+        if target >= self.seglog.tip()[0]:
+            return False
+        self.seglog.truncate_tail(target)
+        pointer = self.checkpoints.current
+        self._sync_tip(pointer["tail_anchor"] if pointer else GENESIS)
+        self._persist_head()
+        # 复制进度回到裁剪点（仍 >= commit_index，绝不丢掉已确认位置）
+        d = self._digest_or_anchor(target) or GENESIS
+        self.replica.advance(target, d, status=SYNCING)
+        return True
+
+    def _follower_follow_page(self, page: dict, applied: int,
+                              imported: bool = True,
+                              transport: Optional[Callable] = None) -> None:
+        """备实例应用一页后：合并主的待定提议/任期标记、跟随提交水位、回报。"""
+        self._merge_primary_meta(page)
+        leader_commit = int(page.get("commit_index", self.commit.commit_index))
+        if leader_commit > self.commit.commit_index:
+            self._follower_advance_commit(leader_commit)
+        # 向主报告已确认位置（持久化 + 推动主的多数派提交）
+        self._follower_ack_primary(transport)
+
+    def _merge_primary_meta(self, page: dict) -> None:
+        """合并来源主的待定提议表与任期标记位置（备实例不自行决定归属）。"""
+        for m in page.get("term_markers", []) or []:
+            self.commit.add_term_marker(int(m["seq"]), int(m["term"]))
+        pending = page.get("pending")
+        if isinstance(pending, list):
+            self.commit.replace_pending([Proposal.from_dict(p) for p in pending])
+        self.commit.persist()
 
     def _raise_conflict(self, seq: int, expected: Any, got: Any, reason: str) -> None:
         self.replica.mark_error(
@@ -1381,6 +2417,17 @@ class Kernel:
                 self.replica.reset_to_installed(
                     pointer["seq"], pointer["tail_anchor"],
                     self.replica.source_boundary)
+            # 即使边界幂等，也跟随来源提交水位与任期标记（可能本轮才到达）
+            source_commit = int(snap.get("commit_index", pointer["seq"]))
+            target = min(source_commit, pointer["seq"])
+            if target > self.commit.commit_index:
+                self.commit.set_commit(
+                    target, int(snap.get("term", self.cluster.term)),
+                    pointer["tail_anchor"] if target >= pointer["seq"]
+                    else (self._digest_or_anchor(target) or GENESIS))
+            for m in snap.get("term_markers", []) or []:
+                self.commit.add_term_marker(int(m["seq"]), int(m["term"]))
+            self.commit.persist()
             return
         if cur is not None and gen <= cur["gen"]:
             raise err(409, "bad_snapshot",
@@ -1451,6 +2498,23 @@ class Kernel:
         self._persist_head()
         self.replica.reset_to_installed(
             seq, new_pointer["tail_anchor"], self.replica.source_boundary)
+        # ---- 提交水位随快照边界安装：备实例只能采纳 min(边界, 来源水位) ----
+        source_commit = int(snap.get("commit_index", seq))
+        new_commit = min(seq, source_commit)
+        # 重装边界可能从更小位置重来：以新边界为准（旧边界整段被来源覆盖）
+        self.commit.commit_index = new_commit
+        self.commit.commit_term = int(snap.get("term", self.cluster.term))
+        self.commit.commit_digest = (
+            new_pointer["tail_anchor"] if new_commit >= seq
+            else (self._digest_or_anchor(new_commit) or GENESIS))
+        # 任期标记位置随边界一并安装
+        for m in snap.get("term_markers", []) or []:
+            self.commit.add_term_marker(int(m["seq"]), int(m["term"]))
+        # 边界之后的待定提议以来源导出为准（边界之内的提议已全部提交）
+        self.commit.replace_pending([
+            Proposal.from_dict(p) for p in (snap.get("pending") or [])
+            if int(p["first_seq"]) > new_commit])
+        self.commit.persist()
 
     @staticmethod
     def _manifest_digest_at(man_body: dict, seq: int) -> Optional[str]:
@@ -1570,6 +2634,10 @@ class Kernel:
             }
             need = len(peers) // 2 + 1
             peer_urls = [u for nid, u in peers if nid != self.cluster.node_id]
+            # 投票方给出的「与候选同一条记录」证明：候选的 advertised
+            # tip 在投票方链上原样存在 -> 可证到 tip；否则只可证到投票方
+            # 自己的提交水位（多数派交集论证，见就任后的前缀裁剪）。
+            attested = [last_log_seq]  # 自己证明自己的整条链
 
         # ---- 阶段 1（锁外 RPC）：向其他成员拉票，自选票已落盘 ----
         refusals: list[dict] = []
@@ -1578,6 +2646,8 @@ class Kernel:
                 _st, resp = transport("POST", url.rstrip("/") + PATH_REQUEST_VOTE, body)
                 if resp.get("vote_granted"):
                     votes += 1
+                    attested.append(int(resp.get("attest_seq",
+                                                 resp.get("commit_seq", -1))))
                 else:
                     refusals.append({"peer": url, "reason": resp.get("reason", "denied"),
                                      "term": resp.get("term")})
@@ -1608,7 +2678,17 @@ class Kernel:
                     self.cluster.s.voted_for != self.cluster.node_id:
                 raise err(409, "already_voted",
                           "voted for another candidate in this term")
+            # ---- 多数派可证前缀：只保留能由多数派证明的日志前缀 ----
+            # attested 中第 need 大的位置即多数派共同持有的最靠后位置；
+            # 其后的半提交尾部是旧主可能独占的记录，绝不暴露、必须裁掉。
+            attested.sort(reverse=True)
+            proven_seq = attested[need - 1] if attested else 0
+            proven_seq = max(proven_seq, self.commit.commit_index)
+            truncated = self._truncate_for_new_leadership(proven_seq, new_term)
             self.cluster.assume_leadership(new_term, ttl)
+            # 新任期先提交一条任期标记：旧任期待定记录不能仅凭新主自己的
+            # 副本变已提交，必须等它随当前任期记录一起越过提交水位。
+            marker_seq = self._append_term_marker(new_term)
             # 提升成功：停止跟随来源（后台复制线程检测到角色后自动退出）
             self.replica.peer_url = None
             if self.replica.status not in (CONFLICT,):
@@ -1617,13 +2697,65 @@ class Kernel:
                 "kind": "promoted", "term": new_term,
                 "last_log_seq": last_log_seq, "grant_ttl_ms": ttl,
                 "votes": votes, "needed": need,
+                "proven_seq": proven_seq, "truncated_to": truncated,
+                "term_marker_seq": marker_seq,
             })
             return {
                 "term": new_term, "role": PRIMARY,
                 "votes": votes, "needed": need,
                 "grant_expires_at": self.cluster.s.grant_expires_at,
                 "last_log_seq": last_log_seq,
+                "proven_seq": proven_seq,
+                "truncated_from": last_log_seq,
+                "truncated_to": truncated,
+                "term_marker_seq": marker_seq,
             }
+
+    def _truncate_for_new_leadership(self, proven_seq: int, new_term: int) -> int:
+        """就任前把本地日志裁到「多数派可证前缀」，丢弃旧主半提交尾部。
+
+        - 已进入提交水位的记录绝不回退（proven_seq 必 >= commit_index）；
+        - 超出 proven_seq 的记录从链尾截断，关联的 write_id 标记为
+          superseded（同 write_id 重试得到明确错误，不追加重复记录）；
+        - 原子批次若部分位于可证前缀之外，整批回滚到 open；
+        - 截断后重建待定提议，但不推进提交水位（旧任期尾部仍须等
+          当前任期的 term_marker 先被多数派确认）。
+        """
+        tip_seq, _ = self.seglog.tip()
+        target = min(proven_seq, tip_seq)
+        if target < tip_seq:
+            self.seglog.truncate_tail(target)
+            pointer = self.checkpoints.current
+            self._sync_tip(pointer["tail_anchor"] if pointer else GENESIS)
+            self._persist_head()
+        # 超出可证前缀的 write_id：标记被新任期取代
+        for wid, e in list(self.commit.writes.items()):
+            if e.get("status") == "pending" and int(e["first_seq"]) > target:
+                self.commit.mark_write_superseded(wid, new_term)
+        # 原子批次：任何记录超出可证前缀即整批回到 open（不拆开批次）
+        for b in list(self.batches.batches.values()):
+            if b.status == COMMITTING and (b.first_seq or 0) > 0 \
+                    and (b.last_seq or b.first_seq) > target:
+                wid = b.write_id
+                if wid and self.commit.get_write(wid):
+                    self.commit.mark_write_superseded(wid, new_term)
+                self.batches.rollback_to_open(b)
+        self.commit.prune_pending_through(target)
+        self.commit.commit_index = min(self.commit.commit_index, target)
+        self.commit.commit_digest = self._digest_or_anchor(self.commit.commit_index) or GENESIS
+        self._rebuild_pending_locked()
+        return target
+
+    def _append_term_marker(self, term: int) -> int:
+        """新主任期开始：写入一条内部 term_marker 记录（当前任期首条记录）。"""
+        seq = self.seglog.next_seq
+        rec = self._append_record_locked(
+            "data", {"kind": "term_marker", "term": term})
+        self.commit.add_term_marker(rec["seq"], term)
+        self.commit.add_proposal(Proposal(
+            rec["seq"], rec["seq"], term=term, kind="term_marker"))
+        self.commit.persist()
+        return seq
 
     def _voter_peers(self, voter_urls: Optional[list[str]]) -> list[tuple[str, str]]:
         """返回竞选涉及的 (node_id, base_url) 列表（含自己）。
@@ -1685,7 +2817,18 @@ class Kernel:
                 return {"term": self.cluster.term, "vote_granted": False,
                         "reason": "log_divergence"}
             self.cluster.cast_vote(term, candidate)
-            return {"term": term, "vote_granted": True, "reason": "ok"}
+            # 多数派可证前缀的证据：候选 advertised 位置的记录在本节点
+            # 链上原样存在 -> 可证到候选 tip；否则只可证到本地提交水位。
+            if last_seq > tip_seq:
+                cand_digest = req.get("last_log_digest")
+                if cand_digest and self._digest_or_anchor(last_seq) == cand_digest:
+                    attest = last_seq
+                else:
+                    attest = self.commit.commit_index
+            else:
+                attest = last_seq  # last_seq == tip_seq（已等长比对摘要）
+            return {"term": term, "vote_granted": True, "reason": "ok",
+                    "attest_seq": attest, "commit_seq": self.commit.commit_index}
 
     def handle_lease_ack(self, term: int) -> dict:
         """RPC：主的任期心跳。见到更高有效任期立即让位（旧主不再提供服务）。"""
@@ -1769,19 +2912,31 @@ class Kernel:
     # =====================================================================
 
     def read(self, start_seq: int, limit: int) -> dict:
+        """读原始事件：默认只展示不超过提交水位 commit_index 的内容。"""
         with self.meta_lock:
             tip, _ = self.seglog.tip()
+            commit_seq = self.commit.commit_index
             pointer = self.checkpoints.current
             low = pointer["seq"] + 1 if pointer else 1
             if start_seq < low:
                 raise err(410, "compacted",
                           f"seq {start_seq} already compacted; readable head is {low}",
                           readable_from=low, checkpoint_gen=pointer["gen"] if pointer else 0)
-            recs = self.seglog.read_records(start_seq, limit)
+            if start_seq > commit_seq:
+                # 请求位置尚在待定（本地已写但未取得多数确认）：不暴露，
+                # 返回空页并附带提交水位（调用方可知何时再读）。
+                return {
+                    "from": start_seq, "tip": tip, "commit_index": commit_seq,
+                    "records": [], "next": start_seq, "has_more": False,
+                    "ahead_of_commit": True,
+                }
+            limit = min(limit, max(0, commit_seq - start_seq + 1))
+            recs = self.seglog.read_records(start_seq, limit) if limit else []
             return {
-                "from": start_seq, "tip": tip, "records": recs,
+                "from": start_seq, "tip": tip, "commit_index": commit_seq,
+                "records": recs,
                 "next": (recs[-1]["seq"] + 1) if recs else start_seq,
-                "has_more": bool(recs and recs[-1]["seq"] < tip),
+                "has_more": bool(recs and recs[-1]["seq"] < commit_seq),
             }
 
     def head_info(self) -> dict:
@@ -1804,24 +2959,42 @@ class Kernel:
     def business_state(self) -> dict:
         """从头读取的业务含义：快照状态 + 尾部重放（等价于压缩前完整重放）。
 
+        默认只折叠不超过提交水位 commit_index 的记录：本地已写但尚未取得
+        多数确认的待定记录不会出现在业务状态里。
         checkpoint_state_* 是快照边界（snapshot_seq 处）的状态；
-        current_state_* 是再叠加现存尾部后的最新业务状态。
+        current_state_* 是再叠加现存提交尾部后的最新业务状态。
         """
         with self.meta_lock:
-            pointer = self.checkpoints.current
-            base = self._load_state(pointer) if pointer else {}
-            r = Reducer(base)
-            for sid in sorted(self.seglog.segments):
-                for rec in self.seglog.iter_segment(sid):
-                    r.apply(rec["type"], rec["payload"])
-            return {
-                "state": r.snapshot(),
-                "current_state_digest": r.digest(),
-                "checkpoint": (
-                    {"gen": pointer["gen"], "snapshot_seq": pointer["seq"],
-                     "state_digest": pointer["state_digest"], "tail_anchor": pointer["tail_anchor"]}
-                    if pointer else None),
-            }
+            return self._committed_state_view()
+
+    def _committed_state_view(self, term: Optional[int] = None,
+                              barrier: bool = False) -> dict:
+        pointer = self.checkpoints.current
+        base = self._load_state(pointer) if pointer else {}
+        commit_seq = self.commit.commit_index
+        r = Reducer(base)
+        for sid in sorted(self.seglog.segments):
+            for rec in self.seglog.iter_segment(sid):
+                if rec["seq"] > commit_seq:
+                    break
+                r.apply(rec["type"], rec["payload"])
+        tip_seq, _ = self.seglog.tip()
+        view = {
+            "state": r.snapshot(),
+            "current_state_digest": r.digest(),
+            "commit_index": commit_seq,
+            "tip_seq": tip_seq,
+            "pending": self.commit.pending_ranges(),
+            "role": self.cluster.role,
+            "term": self.cluster.term,
+            "checkpoint": (
+                {"gen": pointer["gen"], "snapshot_seq": pointer["seq"],
+                 "state_digest": pointer["state_digest"], "tail_anchor": pointer["tail_anchor"]}
+                if pointer else None),
+        }
+        if barrier:
+            view["read_barrier"] = {"term": term, "verified": True}
+        return view
 
     def replication_view(self) -> dict:
         with self.meta_lock:
@@ -1850,7 +3023,31 @@ class Kernel:
                 "tip_seq": tip_seq,
                 "tip_digest": tip_digest,
                 "caught_up": rep["role_status"] == CAUGHT_UP,
+                # ---- 多数派提交水位 ----
+                "commit_index": self.commit.commit_index,
+                "commit_term": self.commit.commit_term,
+                "commit_digest": self.commit.commit_digest,
+                "pending": self.commit.pending_ranges(),
+                "member_acks": self._member_ack_view(),
+                "primary": (self.replica.peer_url if v["role"] != PRIMARY else None),
             }
+
+    def _member_ack_view(self) -> dict:
+        """各成员确认位置：本地 tip（主）/ 已同步位置（备）+ 收到的成员 ack。"""
+        view: dict[str, Any] = {}
+        tip_seq, tip_digest = self.seglog.tip()
+        if self.cluster.role == PRIMARY:
+            view[self.cluster.node_id] = {
+                "match_seq": tip_seq, "commit_seq": self.commit.commit_index,
+                "term": self.cluster.term, "self": True}
+        else:
+            view[self.cluster.node_id] = {
+                "match_seq": self.replica.synced_seq,
+                "commit_seq": self.commit.commit_index,
+                "term": self.cluster.term, "self": True}
+        for nid, a in self.commit.ack_view().items():
+            view[nid] = a
+        return view
 
     def status(self) -> dict:
         with self.meta_lock:
@@ -1876,5 +3073,9 @@ class Kernel:
                 "compaction_running": self._compact_active,
                 "cluster": self.cluster.view(now),
                 "replication": self.replica.view(),
+                "commit_index": self.commit.commit_index,
+                "commit_term": self.commit.commit_term,
+                "pending": self.commit.pending_ranges(),
+                "member_acks": self._member_ack_view(),
                 "data_dir": self.cfg.data_dir,
             }
