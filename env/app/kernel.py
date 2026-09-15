@@ -69,6 +69,7 @@ class Kernel:
         ensure_dir(self.state_dir)
         self.lock_path = os.path.join(cfg.data_dir, "compaction.lock")
         self.result_path = os.path.join(self.state_dir, "compact-result.json")
+        self.head_path = os.path.join(self.state_dir, "head.json")
 
         self.seglog = SegmentLog(self.seg_dir)
         self.readers = ReaderStore(os.path.join(self.state_dir, "readers.json"))
@@ -99,6 +100,7 @@ class Kernel:
                     import shutil
                     shutil.rmtree(self.checkpoints.gen_dir(g), ignore_errors=True)
                 self._sync_tip(GENESIS)
+                self._reconcile_head()
                 recovery["boundary"] = "genesis"
                 return recovery
 
@@ -126,6 +128,7 @@ class Kernel:
                     shutil.rmtree(self.checkpoints.gen_dir(g), ignore_errors=True)
                     pruned.append(g)
             self._sync_tip(pointer["tail_anchor"])
+            self._reconcile_head()
             recovery.update(boundary=f"gen-{gen}", segments_deleted=deleted_now, gens_pruned=pruned)
             return recovery
 
@@ -153,6 +156,69 @@ class Kernel:
         self.seglog._last_digest = tip_digest  # 后续 append 正确续链
 
     # =====================================================================
+    # 链头锚点：持久化链尖摘要，拒绝尾部篡改
+    # =====================================================================
+    # 哈希链只锚定每条记录的「前驱」，checkpoint 只锚定尾部的「起点」；
+    # 链尖（最后一条记录的摘要）若不落盘，改动活动段最后一条记录的内容
+    # 后所有链接依然完好，重启与校验都无法察觉。因此每次追加后把
+    # {seq, digest} 原子写入 state/head.json（先 fsync 段记录、再锚定，
+    # 崩溃只会让锚点落后、绝不会超前），重启与完整性校验据它拒绝篡改。
+
+    def _persist_head(self) -> None:
+        """把当前链尖 {seq, digest} 原子落盘（tmp+rename+fsync）。"""
+        seq, d = self.seglog.tip()
+        write_json(self.head_path, {"seq": seq, "digest": d})
+
+    def _reconcile_head(self) -> None:
+        """启动时核对链头锚点；尾部被篡改/截断则拒绝启动（不静默回退）。
+
+        - 锚点与链尖一致：通过（空活动段重启造成的序号漂移以锚点为准校正）；
+        - 锚点落后于链尖：崩溃时锚点尚未落盘，锚点位置处的链上摘要必须
+          原样，核对一致后把锚点前滚到链尖；
+        - 其余（锚点超前于链尖、同序号摘要不符、锚点位置内容被改）：
+          一律拒绝启动。
+        """
+        tip_seq, tip_digest = self.seglog.tip()
+        if not os.path.exists(self.head_path):
+            # 首次启动（或旧版本数据目录）：以当前链尖为锚落盘
+            self._persist_head()
+            return
+        try:
+            head = read_json(self.head_path)
+            hseq, hdigest = int(head["seq"]), str(head["digest"])
+        except Exception:
+            raise err(500, "tail_corrupt",
+                      "chain head anchor is unreadable; refusing to start")
+        if hdigest == tip_digest:
+            if hseq != tip_seq:
+                self._persist_head()  # 校正序号漂移，摘要不变
+            return
+        if hseq < tip_seq and self._digest_at(hseq) == hdigest:
+            self._persist_head()  # 崩溃滞后：锚点之前原样，前滚
+            return
+        raise err(500, "tail_corrupt",
+                  "live tail does not match persisted chain head; refusing to start",
+                  anchored_seq=hseq, anchored_digest=hdigest[:16],
+                  tip_seq=tip_seq, tip_digest=tip_digest[:16])
+
+    def _digest_at(self, seq: int) -> Optional[str]:
+        """现存链上 seq 处记录的摘要；不存在返回 None。"""
+        if seq == 0:
+            return GENESIS
+        for rec in self.seglog.read_records(seq, 1):
+            if rec["seq"] == seq:
+                return rec["digest"]
+        return None
+
+    def _head_anchor_ok(self, tip_digest: str) -> bool:
+        """持久化的链头锚点是否与（从磁盘重算的）链尖摘要一致。"""
+        try:
+            head = read_json(self.head_path)
+        except Exception:
+            return False
+        return isinstance(head, dict) and head.get("digest") == tip_digest
+
+    # =====================================================================
     # 追加
     # =====================================================================
 
@@ -161,6 +227,9 @@ class Kernel:
             # 入链前校验业务负载，坏记录绝不进哈希链
             Reducer().apply(rec_type, payload)
             rec = self.seglog.append(rec_type, payload, now_ms())
+            # 段记录已 fsync，再锚定链尖：崩溃只会让锚点落后一条，
+            # 启动时按 _reconcile_head 的「落后」分支核对前滚，绝不误伤。
+            self._persist_head()
             if self.seglog.segments[self.seglog.active_id].size >= self.cfg.segment_bytes:
                 self.seglog.rotate()
             return {
@@ -540,10 +609,17 @@ class Kernel:
         return result
 
     def verify_latest(self) -> dict:
-        """复核最近一次压缩边界：快照/清单自校验 + 尾部折叠等价。"""
+        """复核最近一次压缩边界：快照/清单自校验 + 尾部折叠等价 + 链头锚点。"""
         with self.meta_lock:
             pointer = self.checkpoints.current
             if pointer is None:
+                # 尚无压缩边界，也要能拒绝尾部篡改：链必须完整且链尖等于链头锚点
+                vr0 = self.seglog.verify_chain_from(GENESIS)
+                head_ok = vr0.ok and self._head_anchor_ok(vr0.last_digest)
+                if not (vr0.ok and head_ok):
+                    return {"status": "failed",
+                            "checks": {"tail_chain": vr0.ok, "head_anchor": head_ok},
+                            "broken_at": vr0.broken_at}
                 return {"status": "no_checkpoint"}
             gen = pointer["gen"]
             try:
@@ -561,6 +637,8 @@ class Kernel:
                 return {"status": "corrupt", "gen": gen, "reason": str(e)}
             vr = self.seglog.verify_chain_from(pointer["tail_anchor"])
             checks["tail_chain"] = vr.ok
+            # 链尖必须等于持久化的链头锚点：活动段尾部被篡改时此处失败
+            checks["head_anchor"] = vr.ok and self._head_anchor_ok(vr.last_digest)
             # 业务等价（仅依赖当前快照+现存尾部，旧代已删除也不影响）：
             # 从头读取的业务含义 = 当前快照状态 + 现存尾部重放。
             current_digest = None

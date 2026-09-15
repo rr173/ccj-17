@@ -315,6 +315,106 @@ class TestCompaction:
         assert len(audit) == 1 and "digest" in audit[0]
 
 
+# --------------------------------------------------------------------- 链头锚点（尾部篡改）
+
+
+def _rewrite_active_record(k: Kernel, index: int, mutate) -> None:
+    """直接改动活动段中第 index 行记录的内容（保持 prev 链接完好）。"""
+    meta = k.seglog.segments[k.seglog.active_id]
+    lines = open(meta.path, "rb").read().splitlines()
+    rec = json.loads(lines[index].decode())
+    mutate(rec)
+    lines[index] = canonical(rec)
+    with open(meta.path, "wb") as f:
+        f.write(b"\n".join(lines) + b"\n")
+
+
+def _restart(tmp_path) -> Kernel:
+    return Kernel(Config(data_dir=str(tmp_path), segment_bytes=10_000_000,
+                         janitor_enabled=False, compaction_min_segments=1))
+
+
+class TestChainHeadAnchor:
+    def test_head_anchor_persisted_on_every_append(self, tmp_path):
+        k = make_kernel(tmp_path)
+        for i in range(3):
+            k.append("put", {"key": f"k{i}", "value": i})
+            head = read_json(k.head_path)
+            assert head["seq"] == i + 1
+            assert head["digest"] == k.seglog.tip()[1]
+
+    def test_tampered_last_record_rejected_on_restart(self, tmp_path):
+        k = make_kernel(tmp_path)
+        seed(k, 5)
+        _rewrite_active_record(k, -1, lambda r: r["payload"].__setitem__("value", 999999))
+        with pytest.raises(Error) as e:
+            _restart(tmp_path).startup()
+        assert e.value.status == 500 and e.value.code == "tail_corrupt"
+
+    def test_tampered_last_record_fails_verify_without_checkpoint(self, tmp_path):
+        k = make_kernel(tmp_path)
+        seed(k, 5)
+        _rewrite_active_record(k, -1, lambda r: r["payload"].__setitem__("value", 999999))
+        v = k.verify_latest()
+        assert v["status"] == "failed" and v["checks"]["head_anchor"] is False
+
+    def test_tampered_last_record_after_compaction_rejected(self, tmp_path):
+        k = make_kernel(tmp_path)
+        seed(k, 8, rotate_at=(3,))
+        assert k.compact(force=True)["status"] == "ok"
+        _rewrite_active_record(k, -1, lambda r: r["payload"].__setitem__("value", 424242))
+        v = k.verify_latest()
+        assert v["status"] == "failed" and v["checks"]["head_anchor"] is False
+        with pytest.raises(Error) as e:
+            _restart(tmp_path).startup()
+        assert e.value.code == "tail_corrupt"
+
+    def test_tampered_middle_record_rejected_on_restart(self, tmp_path):
+        # 改中间一条：链在后续记录处断开，scan 截断后锚点超前 -> 拒绝启动
+        k = make_kernel(tmp_path)
+        seed(k, 6)
+        _rewrite_active_record(k, 1, lambda r: r["payload"].__setitem__("value", 777))
+        with pytest.raises(Error) as e:
+            _restart(tmp_path).startup()
+        assert e.value.code == "tail_corrupt"
+
+    def test_truncated_last_record_rejected_on_restart(self, tmp_path):
+        # 直接删掉最后一条完整记录：锚点超前于链尖 -> 拒绝启动
+        k = make_kernel(tmp_path)
+        seed(k, 4)
+        meta = k.seglog.segments[k.seglog.active_id]
+        lines = open(meta.path, "rb").read().splitlines()
+        with open(meta.path, "wb") as f:
+            f.write(b"\n".join(lines[:-1]) + b"\n")
+        with pytest.raises(Error) as e:
+            _restart(tmp_path).startup()
+        assert e.value.code == "tail_corrupt"
+
+    def test_crash_lagging_anchor_fast_forwards(self, tmp_path):
+        # 段记录已 fsync、锚点尚未落盘（崩溃窗口）：重启核对后前滚锚点
+        k = make_kernel(tmp_path)
+        seed(k, 3)
+        tip_seq, tip_d = k.seglog.tip()
+        rec = {"seq": tip_seq + 1, "ts": 1, "type": "put",
+               "payload": {"key": "kx", "value": 9}, "prev": tip_d}
+        meta = k.seglog.segments[k.seglog.active_id]
+        with open(meta.path, "ab") as f:
+            f.write(canonical(rec) + b"\n")
+            f.flush()
+            os.fsync(f.fileno())
+        k2 = make_kernel(tmp_path)
+        assert k2.seglog.tip()[0] == tip_seq + 1
+        assert k2.business_state()["state"]["kx"] == 9
+        assert read_json(k2.head_path)["seq"] == tip_seq + 1
+
+    def test_clean_restart_unaffected(self, tmp_path):
+        k = make_kernel(tmp_path)
+        seed(k, 4)
+        k2 = make_kernel(tmp_path)
+        assert k2.business_state()["state"] == expected_state(4)
+        assert k2.append("put", {"key": "k9", "value": 9})["seq"] == 5
+
+
 # --------------------------------------------------------------------- 校验失败 -> 回滚
 
 
@@ -342,7 +442,9 @@ class TestVerifyFailureRollback:
         assert not os.path.exists(k.checkpoints._current_path())
         assert sid in k.seglog.segments
         assert not k.checkpoints.temp_dirs()
-        assert k.verify_latest()["status"] == "no_checkpoint"
+        # 完整性检查如实报告磁盘上的断链（而不是若无其事的 no_checkpoint）
+        v = k.verify_latest()
+        assert v["status"] == "failed" and v["checks"]["tail_chain"] is False
 
     def test_tampered_snapshot_after_write_aborts(self, tmp_path, monkeypatch):
         k = make_kernel(tmp_path)
