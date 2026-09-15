@@ -565,3 +565,322 @@ class TestCrashRecovery:
                            janitor_enabled=False, compaction_min_segments=1))
         rec2 = k2.startup()
         assert rec2["boundary"] == "gen-1" and rec2["segments_deleted"] == []
+
+
+# --------------------------------------------------------------------- 原子批次
+
+
+class TestBatch:
+    def test_commit_visibility_and_order(self, tmp_path):
+        k = make_kernel(tmp_path)
+        k.append("put", {"key": "base", "value": 0})  # seq 1
+        b = k.create_batch("k-1", 60_000)
+        bid = b["batch_id"]
+        assert b["status"] == "open" and b["remaining_ms"] > 0
+        k.batch_add_ops(bid, [{"type": "put", "payload": {"key": "a", "value": 1}}])
+        k.batch_add_ops(bid, [{"type": "delete", "payload": {"key": "base"}},
+                              {"type": "data", "payload": {"n": 1}}])
+        # 提交前：普通读取与业务状态都看不到批次记录
+        assert k.seglog.tip()[0] == 1
+        assert k.business_state()["state"] == {"base": 0}
+        assert [r["seq"] for r in k.read(1, 100)["records"]] == [1]
+        # 提交：整批按加入顺序一次性可见
+        res = k.commit_batch(bid)
+        assert res["status"] == "committed" and res["replay"] is False
+        assert (res["first_seq"], res["last_seq"], res["record_count"]) == (2, 4, 3)
+        recs = k.read(2, 10)["records"]
+        assert [r["seq"] for r in recs] == [2, 3, 4]
+        assert [r["type"] for r in recs] == ["put", "delete", "data"]
+        assert k.business_state()["state"] == {"a": 1}
+        # 批次最终状态与日志序号范围可查询
+        v = k.batch_view(bid)
+        assert v["status"] == "committed"
+        assert (v["first_seq"], v["last_seq"], v["record_count"]) == (2, 4, 3)
+        assert v["content_hash"] == res["content_hash"]
+
+    def test_same_batch_double_commit_returns_first_result(self, tmp_path):
+        k = make_kernel(tmp_path)
+        bid = k.create_batch("k-dup", 60_000)["batch_id"]
+        k.batch_add_ops(bid, [{"type": "put", "payload": {"key": "a", "value": 1}}])
+        r1 = k.commit_batch(bid)
+        r2 = k.commit_batch(bid)
+        assert r1["first_seq"] == r2["first_seq"] == 1
+        assert r2["replay"] is True
+        assert k.seglog.tip()[0] == 1  # 没有重复入链
+
+    def test_idempotent_key_replay_across_batches(self, tmp_path):
+        k = make_kernel(tmp_path)
+        ops = [{"type": "put", "payload": {"key": "a", "value": 1}}]
+        b1 = k.create_batch("same-key", 60_000)["batch_id"]
+        k.batch_add_ops(b1, ops)
+        r1 = k.commit_batch(b1)
+        # 新批次、同幂等键、同内容 -> 返回第一次结果，不重复入链
+        b2 = k.create_batch("same-key", 60_000)["batch_id"]
+        k.batch_add_ops(b2, ops)
+        r2 = k.commit_batch(b2)
+        assert r2["replay"] is True
+        assert (r2["first_seq"], r2["last_seq"]) == (r1["first_seq"], r1["last_seq"])
+        assert k.seglog.tip()[0] == 1
+        # 第二个批次也落成 committed 且指向首次序号范围
+        v2 = k.batch_view(b2)
+        assert v2["status"] == "committed" and v2["replay"] is True
+        assert v2["first_seq"] == r1["first_seq"]
+
+    def test_idempotent_key_conflict(self, tmp_path):
+        k = make_kernel(tmp_path)
+        b1 = k.create_batch("c-key", 60_000)["batch_id"]
+        k.batch_add_ops(b1, [{"type": "put", "payload": {"key": "a", "value": 1}}])
+        k.commit_batch(b1)
+        b2 = k.create_batch("c-key", 60_000)["batch_id"]
+        k.batch_add_ops(b2, [{"type": "put", "payload": {"key": "a", "value": 2}}])
+        with pytest.raises(Error) as e:
+            k.commit_batch(b2)
+        assert e.value.status == 409 and e.value.code == "idempotency_conflict"
+        assert k.seglog.tip()[0] == 1  # 冲突提交不入链
+
+    def test_concurrent_commit_single_effective(self, tmp_path):
+        k = make_kernel(tmp_path)
+        bid = k.create_batch("cc", 60_000)["batch_id"]
+        k.batch_add_ops(bid, [{"type": "put", "payload": {"key": f"k{i}", "value": i}}
+                              for i in range(5)])
+        results = []
+
+        def do():
+            results.append(k.commit_batch(bid))
+
+        ts = [threading.Thread(target=do) for _ in range(4)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        # 只有一个提交真正生效，其余拿到同一首次结果
+        assert {r["first_seq"] for r in results} == {1}
+        assert sum(1 for r in results if not r["replay"]) == 1
+        assert k.seglog.tip()[0] == 5
+
+    def test_abort_then_commit_rejected(self, tmp_path):
+        k = make_kernel(tmp_path)
+        bid = k.create_batch("ab", 60_000)["batch_id"]
+        k.batch_add_ops(bid, [{"type": "put", "payload": {"key": "a", "value": 1}}])
+        v = k.abort_batch(bid)
+        assert v["status"] == "aborted"
+        with pytest.raises(Error) as e:
+            k.commit_batch(bid)
+        assert e.value.status == 409 and e.value.code == "batch_aborted"
+        with pytest.raises(Error) as e2:
+            k.batch_add_ops(bid, [{"type": "data", "payload": {}}])
+        assert e2.value.status == 409
+        assert k.seglog.tip()[0] == 0  # 从未占用日志序号
+
+    def test_expiry_blocks_commit_and_ops(self, tmp_path):
+        k = make_kernel(tmp_path)
+        bid = k.create_batch("ttl", 1000)["batch_id"]
+        k.batch_add_ops(bid, [{"type": "put", "payload": {"key": "a", "value": 1}}])
+        time.sleep(1.1)
+        with pytest.raises(Error) as e:
+            k.commit_batch(bid)
+        assert e.value.status == 410 and e.value.code == "batch_expired"
+        with pytest.raises(Error) as e2:
+            k.batch_add_ops(bid, [{"type": "data", "payload": {}}])
+        assert e2.value.status == 410
+        assert k.batch_view(bid)["status"] == "expired"
+        # 过期批次不占日志序号
+        assert k.seglog.tip()[0] == 0
+        assert k.append("put", {"key": "n", "value": 1})["seq"] == 1
+
+    def test_empty_batch_rejected(self, tmp_path):
+        k = make_kernel(tmp_path)
+        bid = k.create_batch("e", 60_000)["batch_id"]
+        with pytest.raises(Error) as e:
+            k.commit_batch(bid)
+        assert e.value.status == 400 and e.value.code == "empty_batch"
+
+    def test_add_ops_validates_payload(self, tmp_path):
+        k = make_kernel(tmp_path)
+        bid = k.create_batch("v", 60_000)["batch_id"]
+        with pytest.raises(Error) as e:
+            k.batch_add_ops(bid, [{"type": "put", "payload": {"key": "x"}}])
+        assert e.value.status == 400
+        with pytest.raises(Error):
+            k.batch_add_ops(bid, [{"type": "nope", "payload": {}}])
+        assert k.batch_view(bid)["op_count"] == 0  # 坏批次不残留
+
+    def test_unknown_batch_404(self, tmp_path):
+        k = make_kernel(tmp_path)
+        with pytest.raises(Error) as e:
+            k.commit_batch("b-nope")
+        assert e.value.status == 404
+        with pytest.raises(Error):
+            k.batch_view("b-nope")
+
+    def test_open_batch_survives_restart(self, tmp_path):
+        k = make_kernel(tmp_path)
+        bid = k.create_batch("persist", 60_000)["batch_id"]
+        k.batch_add_ops(bid, [{"type": "put", "payload": {"key": "a", "value": 1}}])
+        k2 = make_kernel(tmp_path)
+        v = k2.batch_view(bid)
+        assert v["status"] == "open" and v["op_count"] == 1
+        r = k2.commit_batch(bid)
+        assert r["first_seq"] == 1
+        assert k2.business_state()["state"] == {"a": 1}
+
+    def test_committed_batch_idempotent_after_restart(self, tmp_path):
+        k = make_kernel(tmp_path)
+        bid = k.create_batch("pq", 60_000)["batch_id"]
+        k.batch_add_ops(bid, [{"type": "put", "payload": {"key": "a", "value": 1}}])
+        k.commit_batch(bid)
+        k2 = make_kernel(tmp_path)
+        v = k2.batch_view(bid)
+        assert v["status"] == "committed" and v["first_seq"] == 1
+        # 重启后重复提交仍返回首次结果
+        r = k2.commit_batch(bid)
+        assert r["replay"] is True and r["first_seq"] == 1
+        assert k2.seglog.tip()[0] == 1
+
+    def test_commit_failure_rolls_back_whole_batch(self, tmp_path, monkeypatch):
+        k = make_kernel(tmp_path)
+        k.append("put", {"key": "base", "value": 0})  # seq 1
+        bid = k.create_batch("f", 60_000)["batch_id"]
+        k.batch_add_ops(bid, [{"type": "put", "payload": {"key": "a", "value": 1}},
+                              {"type": "put", "payload": {"key": "b", "value": 2}}])
+        orig = k.seglog.append
+        calls = {"n": 0}
+
+        def flaky(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise OSError("disk on fire")
+            return orig(*a, **kw)
+
+        monkeypatch.setattr(k.seglog, "append", flaky)
+        with pytest.raises(OSError):
+            k.commit_batch(bid)
+        # 半批已整批回滚：链尖、业务状态、批次状态都回到提交前
+        assert k.seglog.tip()[0] == 1
+        assert k.business_state()["state"] == {"base": 0}
+        assert k.batch_view(bid)["status"] == "open"
+        # 重试成功且序号无空洞
+        monkeypatch.undo()
+        r = k.commit_batch(bid)
+        assert (r["first_seq"], r["last_seq"]) == (2, 3)
+        assert k.business_state()["state"] == {"base": 0, "a": 1, "b": 2}
+
+    def test_truncate_tail_across_segments(self, tmp_path):
+        k = make_kernel(tmp_path, segment_bytes=150)  # 小段强制滚动
+        for i in range(8):
+            k.append("put", {"key": f"k{i}", "value": i})
+        assert len(k.seglog.segments) >= 3
+        k.seglog.truncate_tail(3)
+        k._sync_tip("0" * 64)
+        k._persist_head()
+        assert k.seglog.tip()[0] == 3
+        assert k.seglog.verify_chain().ok
+        rec = k.append("put", {"key": "n", "value": 1})
+        assert rec["seq"] == 4  # 回滚后序号无空洞
+        assert k.business_state()["state"] == {"k0": 0, "k1": 1, "k2": 2, "n": 1}
+
+    def test_truncate_tail_to_empty_log(self, tmp_path):
+        k = make_kernel(tmp_path)
+        for i in range(3):
+            k.append("put", {"key": f"k{i}", "value": i})
+        k.seglog.truncate_tail(0)  # 整批从 seq1 开始 -> 全部回滚
+        k._sync_tip("0" * 64)
+        k._persist_head()
+        assert k.seglog.tip()[0] == 0
+        assert k.business_state()["state"] == {}
+        assert k.append("put", {"key": "n", "value": 1})["seq"] == 1
+        # 重启后依旧稳定（链头锚点与空链尖一致）
+        k2 = make_kernel(tmp_path)
+        assert k2.seglog.tip()[0] == 1
+        assert k2.business_state()["state"] == {"n": 1}
+
+
+# --------------------------------------------------------------------- 批次崩溃恢复
+
+
+BATCH_CRASH_SCRIPT = r"""
+import sys; sys.path.insert(0, {root!r})
+from app.kernel import Kernel, Config
+cfg = Config(data_dir={data!r}, segment_bytes={seg_bytes}, janitor_enabled=False,
+             compaction_min_segments=1, crash_hook={hook!r})
+k = Kernel(cfg); k.startup()
+for i in range(3):
+    k.append("put", {{"key": f"base{{i}}", "value": i}})
+bid = k.create_batch("idem-1", 600000)["batch_id"]
+k.batch_add_ops(bid, [{{"type": "put", "payload": {{"key": "bx", "value": 1}}}},
+                      {{"type": "put", "payload": {{"key": "by", "value": 2}}}}])
+k.commit_batch(bid)
+"""
+
+
+class TestBatchCrashRecovery:
+    def _crash_then_recover(self, tmp_path, hook, seg_bytes=10_000_000):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        script = BATCH_CRASH_SCRIPT.format(root=root, data=str(tmp_path),
+                                           seg_bytes=seg_bytes, hook=hook)
+        p = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+        assert p.returncode == 99, (hook, p.returncode, p.stderr[-800:])
+        k2 = Kernel(Config(data_dir=str(tmp_path), segment_bytes=seg_bytes,
+                           janitor_enabled=False, compaction_min_segments=1))
+        rec = k2.startup()
+        return k2, rec
+
+    def test_crash_after_mark_rolls_back(self, tmp_path):
+        # 崩溃于 committing 落盘后、任何记录入链前
+        k, rec = self._crash_then_recover(tmp_path, "batch_after_mark")
+        rb = rec["batches"]["rolled_back"]
+        assert len(rb) == 1
+        assert k.seglog.tip()[0] == 3  # 链尾原样
+        assert k.batch_view(rb[0])["status"] == "open"
+        r = k.commit_batch(rb[0])  # 重试成功
+        assert r["first_seq"] == 4 and r["last_seq"] == 5
+
+    def test_crash_after_append_rolls_back_whole_batch(self, tmp_path):
+        # 崩溃于整批记录已入链、幂等登记（提交点）之前
+        k, rec = self._crash_then_recover(tmp_path, "batch_after_append")
+        rb = rec["batches"]["rolled_back"]
+        assert len(rb) == 1
+        # 整批未提交：链尾回到批次之前，业务状态无半批记录
+        assert k.seglog.tip()[0] == 3
+        assert k.business_state()["state"] == {"base0": 0, "base1": 1, "base2": 2}
+        assert k.batch_view(rb[0])["status"] == "open"
+        # 回滚不占序号：重试提交拿到同一 first_seq
+        r = k.commit_batch(rb[0])
+        assert (r["first_seq"], r["last_seq"]) == (4, 5)
+        assert k.business_state()["state"]["bx"] == 1
+        assert k.seglog.verify_chain().ok
+
+    def test_crash_after_append_with_segment_rollover(self, tmp_path):
+        # 小段：批次提交中途触发滚动，回滚要跨段截断并删除滚出的段
+        k, rec = self._crash_then_recover(tmp_path, "batch_after_append", seg_bytes=150)
+        rb = rec["batches"]["rolled_back"]
+        assert len(rb) == 1
+        assert k.seglog.tip()[0] == 3
+        assert k.business_state()["state"] == {"base0": 0, "base1": 1, "base2": 2}
+        r = k.commit_batch(rb[0])
+        assert r["first_seq"] == 4
+        assert k.seglog.verify_chain().ok
+        st = k.business_state()["state"]
+        assert st["bx"] == 1 and st["by"] == 2
+
+    def test_crash_after_register_finalizes_whole_batch(self, tmp_path):
+        # 崩溃于幂等登记（提交点）之后、批次状态落盘之前
+        k, rec = self._crash_then_recover(tmp_path, "batch_after_register")
+        fin = rec["batches"]["finalized"]
+        assert len(fin) == 1
+        # 整批已提交：两条记录都在
+        assert k.seglog.tip()[0] == 5
+        st = k.business_state()["state"]
+        assert st["bx"] == 1 and st["by"] == 2
+        v = k.batch_view(fin[0])
+        assert v["status"] == "committed" and (v["first_seq"], v["last_seq"]) == (4, 5)
+        # 恢复后重复提交遵守原幂等结果
+        r = k.commit_batch(fin[0])
+        assert r["replay"] is True and r["first_seq"] == 4
+        # 换批次、同幂等键、同内容：仍返回首次结果，不重复入链
+        b2 = k.create_batch("idem-1", 600000)["batch_id"]
+        k.batch_add_ops(b2, [{"type": "put", "payload": {"key": "bx", "value": 1}},
+                             {"type": "put", "payload": {"key": "by", "value": 2}}])
+        r2 = k.commit_batch(b2)
+        assert r2["replay"] is True and r2["first_seq"] == 4
+        assert k.seglog.tip()[0] == 5

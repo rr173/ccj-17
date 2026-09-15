@@ -18,6 +18,7 @@ import os
 import threading
 from typing import Any, Optional
 
+from .batches import ABORTED, COMMITTED, COMMITTING, EXPIRED, OPEN, Batch, BatchStore, ops_hash
 from .checkpoints import (
     AUDIT,
     Checkpointer,
@@ -73,6 +74,7 @@ class Kernel:
 
         self.seglog = SegmentLog(self.seg_dir)
         self.readers = ReaderStore(os.path.join(self.state_dir, "readers.json"))
+        self.batches = BatchStore(os.path.join(self.state_dir, "batches.json"))
         self.checkpoints = Checkpointer(self.cp_dir, os.path.join(self.cp_dir, AUDIT))
         self.meta_lock = threading.RLock()
         self._compact_active = False
@@ -99,38 +101,68 @@ class Kernel:
                 for g in self.checkpoints.existing_gens():
                     import shutil
                     shutil.rmtree(self.checkpoints.gen_dir(g), ignore_errors=True)
-                self._sync_tip(GENESIS)
-                self._reconcile_head()
+                anchor = GENESIS
                 recovery["boundary"] = "genesis"
-                return recovery
+            else:
+                gen = pointer["gen"]
+                try:
+                    snap_body, man_body = self.checkpoints.load_generation(gen)
+                    self._verify_pointer_target(pointer, snap_body, man_body)
+                except (FileNotFoundError, ValueError) as e:
+                    # 已提交边界自身损坏：不静默篡改历史，明确失败
+                    raise err(500, "boundary_corrupt",
+                              "committed checkpoint boundary is corrupt; refusing to start",
+                              gen=gen, reason=str(e))
 
-            gen = pointer["gen"]
-            try:
-                snap_body, man_body = self.checkpoints.load_generation(gen)
-                self._verify_pointer_target(pointer, snap_body, man_body)
-            except (FileNotFoundError, ValueError) as e:
-                # 已提交边界自身损坏：不静默篡改历史，明确失败
-                raise err(500, "boundary_corrupt",
-                          "committed checkpoint boundary is corrupt; refusing to start",
-                          gen=gen, reason=str(e))
+                # 指针有效：幂等补删已承诺覆盖的段、清理非当前代目录
+                covered = set(pointer.get("covered_segs", []))
+                deleted_now: list[int] = []
+                for seg_id in sorted(covered):
+                    if seg_id in self.seglog.segments:
+                        self.seglog.delete_segment(seg_id)
+                        deleted_now.append(seg_id)
+                pruned = self.checkpoints.remove_gens_before(gen)
+                for g in self.checkpoints.existing_gens():
+                    if g != gen:
+                        import shutil
+                        shutil.rmtree(self.checkpoints.gen_dir(g), ignore_errors=True)
+                        pruned.append(g)
+                anchor = pointer["tail_anchor"]
+                recovery.update(boundary=f"gen-{gen}", segments_deleted=deleted_now, gens_pruned=pruned)
 
-            # 指针有效：幂等补删已承诺覆盖的段、清理非当前代目录
-            covered = set(pointer.get("covered_segs", []))
-            deleted_now: list[int] = []
-            for seg_id in sorted(covered):
-                if seg_id in self.seglog.segments:
-                    self.seglog.delete_segment(seg_id)
-                    deleted_now.append(seg_id)
-            pruned = self.checkpoints.remove_gens_before(gen)
-            for g in self.checkpoints.existing_gens():
-                if g != gen:
-                    import shutil
-                    shutil.rmtree(self.checkpoints.gen_dir(g), ignore_errors=True)
-                    pruned.append(g)
-            self._sync_tip(pointer["tail_anchor"])
+            # 批次崩溃恢复：committing 批次只能恢复成整批已提交或整批未提交，
+            # 绝不暴露半批记录（须在链头锚点核对之前完成截断）
+            batch_rec = self._recover_batches()
+            if batch_rec:
+                recovery["batches"] = batch_rec
+            self._sync_tip(anchor)
+            if batch_rec.get("rolled_back"):
+                # 链尾被回滚截断：以新链尖重写链头锚点后再核对
+                self._persist_head()
             self._reconcile_head()
-            recovery.update(boundary=f"gen-{gen}", segments_deleted=deleted_now, gens_pruned=pruned)
             return recovery
+
+    def _recover_batches(self) -> dict:
+        """清算 committing 状态的批次：已登记的补记为整批已提交，否则整批回滚。"""
+        finalized: list[str] = []
+        rolled_back: list[str] = []
+        for b in self.batches.committing_batches():
+            entry = self.batches.commit_entry(b.registry_key())
+            if entry is not None and entry.get("content_hash") == b.content_hash:
+                # 提交点（幂等登记落盘）已过：整批已提交，补记批次状态
+                self.batches.mark_committed(b, entry, replay=False)
+                finalized.append(b.batch_id)
+            else:
+                # 提交点未到：整批未提交。批次记录必是链尾后缀，截断回滚，
+                # 批次回到 open（有效期内可重试），不占任何日志序号。
+                keep = (b.first_seq or 1) - 1
+                if self.seglog.tip()[0] > keep:
+                    self.seglog.truncate_tail(keep)
+                self.batches.rollback_to_open(b)
+                rolled_back.append(b.batch_id)
+        if not (finalized or rolled_back):
+            return {}
+        return {"finalized": finalized, "rolled_back": rolled_back}
 
     def _verify_pointer_target(self, pointer: dict, snap_body: dict, man_body: dict) -> None:
         if snap_body["snapshot_seq"] != pointer["seq"]:
@@ -240,6 +272,178 @@ class Kernel:
                 "prev": rec["prev"],
                 "digest": rec["digest"],
             }
+
+    # =====================================================================
+    # 原子批次（幂等键）
+    # =====================================================================
+    # 未提交的批次只存在于 state/batches.json，普通读取与业务状态都看不到；
+    # 提交时整批按加入顺序一次性入链（全程持 meta_lock，读者不会看到半批）。
+    # 提交协议与崩溃恢复见 app/batches.py 模块 docstring。
+
+    MAX_BATCH_OPS = 10_000  # 单批次操作数上限
+
+    def create_batch(self, idempotency_key: Optional[str], ttl_ms: Optional[int]) -> dict:
+        with self.meta_lock:
+            if idempotency_key is not None:
+                if not isinstance(idempotency_key, str) or not (1 <= len(idempotency_key) <= 256):
+                    raise err(400, "bad_request", "idempotency_key must be a string of length 1..256")
+            ttl = self._clamp_ttl(ttl_ms)
+            b = self.batches.create(idempotency_key, ttl, now_ms())
+            return self._batch_view(b, include_ops=True)
+
+    def batch_add_ops(self, batch_id: str, ops: Any) -> dict:
+        with self.meta_lock:
+            b = self._require_batch(batch_id)
+            st = b.effective_status(now_ms())
+            if st == EXPIRED:
+                raise err(410, "batch_expired", "batch expired; create a new batch")
+            if st != OPEN:
+                raise err(409, "batch_closed", f"batch is {st}; cannot add ops")
+            if not isinstance(ops, list) or not ops:
+                raise err(400, "bad_request", "ops must be a non-empty list")
+            if len(b.ops) + len(ops) > self.MAX_BATCH_OPS:
+                raise err(413, "batch_too_large",
+                          f"batch would exceed {self.MAX_BATCH_OPS} ops")
+            normed = []
+            for op in ops:
+                if not isinstance(op, dict) or "type" not in op:
+                    raise err(400, "bad_request", "each op requires {type, payload}")
+                # 入批前校验业务负载，坏记录绝不进批次
+                Reducer().apply(op["type"], op.get("payload"))
+                normed.append({"type": op["type"], "payload": op.get("payload")})
+            self.batches.add_ops(b, normed)
+            return self._batch_view(b, include_ops=True)
+
+    def commit_batch(self, batch_id: str) -> dict:
+        """提交批次：整批记录按加入顺序一次性入链；幂等键保证重试安全。
+
+        - 同批次/同幂等键重复提交相同内容 -> 返回首次提交结果（不重复入链）；
+        - 同幂等键不同内容 -> 409 idempotency_conflict；
+        - 并发提交由 meta_lock 串行化，只有一个真正入链，其余拿到重放结果。
+        """
+        with self.meta_lock:
+            b = self._require_batch(batch_id)
+            if b.status == COMMITTED:
+                # 同批次重复提交：返回首次结果，不重复入链
+                return self._batch_result(b, replay=True)
+            if b.status == ABORTED:
+                raise err(409, "batch_aborted", "batch was aborted; cannot commit")
+            if b.status == COMMITTING:
+                # 正常流程不可达（启动恢复已清算）；防御性拒绝
+                raise err(409, "batch_committing", "batch commit already in progress")
+            if b.effective_status(now_ms()) == EXPIRED:
+                raise err(410, "batch_expired", "batch expired; cannot commit")
+            if not b.ops:
+                raise err(400, "empty_batch", "cannot commit an empty batch")
+            content_hash = ops_hash(b.ops)
+            key = b.registry_key()
+            entry = self.batches.commit_entry(key)
+            if entry is not None:
+                if entry["content_hash"] == content_hash:
+                    # 同一幂等键相同内容：整批不重发，返回首次提交结果
+                    self.batches.mark_committed(b, entry, replay=True)
+                    return self._batch_result(b, replay=True)
+                raise err(409, "idempotency_conflict",
+                          "idempotency key already committed with different content",
+                          idempotency_key=b.idempotency_key,
+                          first_batch_id=entry["batch_id"],
+                          first_seq=entry["first_seq"], last_seq=entry["last_seq"])
+            # 新鲜提交：committing 落盘 -> 整批入链 -> 幂等登记（提交点）-> 状态落盘
+            first_seq = self.seglog.next_seq
+            self.batches.mark_committing(b, first_seq, content_hash)
+            self._crash_hook("batch_after_mark")
+            try:
+                last_seq = first_seq - 1
+                for op in b.ops:
+                    last_seq = self.append(op["type"], op["payload"])["seq"]
+            except Exception:
+                # 运行期失败同样整批回滚，不留半批
+                self._rollback_uncommitted(b, first_seq)
+                raise
+            self._crash_hook("batch_after_append")
+            entry = {
+                "key": key,
+                "batch_id": b.batch_id,
+                "content_hash": content_hash,
+                "first_seq": first_seq,
+                "last_seq": last_seq,
+                "record_count": last_seq - first_seq + 1,
+                "committed_ts": now_ms(),
+            }
+            self.batches.register_commit(key, entry)  # —— 唯一提交点
+            self._crash_hook("batch_after_register")
+            self.batches.mark_committed(b, entry, replay=False)
+            return self._batch_result(b, replay=False)
+
+    def _rollback_uncommitted(self, b: Batch, first_seq: int) -> None:
+        """整批回滚：截断链尾到批次之前，校准链尖与链头锚点，批次回到 open。"""
+        keep = first_seq - 1
+        if self.seglog.tip()[0] > keep:
+            self.seglog.truncate_tail(keep)
+            pointer = self.checkpoints.current
+            self._sync_tip(pointer["tail_anchor"] if pointer else GENESIS)
+            self._persist_head()
+        self.batches.rollback_to_open(b)
+
+    def abort_batch(self, batch_id: str) -> dict:
+        with self.meta_lock:
+            b = self._require_batch(batch_id)
+            if b.status == COMMITTED:
+                raise err(409, "batch_committed", "batch already committed; cannot abort")
+            if b.status == COMMITTING:
+                raise err(409, "batch_committing", "batch commit in progress; cannot abort")
+            if b.status != ABORTED:
+                self.batches.mark_aborted(b)  # 放弃是幂等的
+            return self._batch_view(b, include_ops=True)
+
+    def batch_view(self, batch_id: str) -> dict:
+        with self.meta_lock:
+            return self._batch_view(self._require_batch(batch_id), include_ops=True)
+
+    def list_batches(self) -> dict:
+        with self.meta_lock:
+            ordered = sorted(self.batches.batches.values(), key=lambda x: (x.created_at, x.batch_id))
+            return {"batches": [self._batch_view(b) for b in ordered]}
+
+    def _require_batch(self, batch_id: str) -> Batch:
+        b = self.batches.get(batch_id)
+        if b is None:
+            raise err(404, "not_found", f"unknown batch {batch_id!r}")
+        return b
+
+    def _batch_view(self, b: Batch, include_ops: bool = False) -> dict:
+        now = now_ms()
+        v = {
+            "batch_id": b.batch_id,
+            "idempotency_key": b.idempotency_key,
+            "status": b.effective_status(now),
+            "op_count": len(b.ops),
+            "first_seq": b.first_seq,
+            "last_seq": b.last_seq,
+            "record_count": b.record_count,
+            "content_hash": b.content_hash,
+            "replay": b.replay,
+            "created_at": b.created_at,
+            "expires_at": b.expires_at,
+            "remaining_ms": max(0, b.expires_at - now) if b.status == OPEN else 0,
+            "committed_ts": b.committed_ts,
+        }
+        if include_ops:
+            v["ops"] = b.ops
+        return v
+
+    def _batch_result(self, b: Batch, replay: bool) -> dict:
+        return {
+            "batch_id": b.batch_id,
+            "idempotency_key": b.idempotency_key,
+            "status": "committed",
+            "replay": replay,
+            "first_seq": b.first_seq,
+            "last_seq": b.last_seq,
+            "record_count": b.record_count,
+            "content_hash": b.content_hash,
+            "committed_ts": b.committed_ts,
+        }
 
     # =====================================================================
     # 租约 / 钉位
@@ -724,12 +928,20 @@ class Kernel:
         with self.meta_lock:
             tip, tip_digest = self.seglog.tip()
             now = now_ms()
+            batch_statuses = [b.effective_status(now) for b in self.batches.batches.values()]
             return {
                 "tip_seq": tip,
                 "tip_digest": tip_digest,
                 "segments": self.seglog.meta_view(),
                 "readers": {"active": len(self.readers.active(now)), "total": len(self.readers.readers),
                             "oldest_pin_seq": self.readers.oldest_pin(now)},
+                "batches": {
+                    "total": len(batch_statuses),
+                    "open": batch_statuses.count(OPEN),
+                    "committed": batch_statuses.count(COMMITTED),
+                    "aborted": batch_statuses.count(ABORTED),
+                    "expired": batch_statuses.count(EXPIRED),
+                },
                 "pinning": self.pin_view(),
                 "checkpoint": self.head_info()["checkpoint"],
                 "last_compaction": self.last_compact,

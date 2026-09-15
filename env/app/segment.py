@@ -26,6 +26,8 @@ from .common import (
     digest_json,
     ensure_dir,
     err,
+    fsync_dirfd,
+    remove_quiet,
 )
 
 PREFIX = "seg-"
@@ -103,8 +105,11 @@ class SegmentLog:
 
         每段独立按段内哈希链校验（跨段锚点由 Kernel 依据快照指针复核）；
         段内中途断链处之后的内容视为未完成写入，一并截断。
+        全量重建：游标与链尖先复位，再由现存段重新推出。
         """
         self.segments.clear()
+        self.next_seq = 1
+        self._last_digest = GENESIS
         ids = sorted(pid for pid in (parse_seg_name(n) for n in os.listdir(self.dir)) if pid is not None)
         for seg_id in ids:
             path = os.path.join(self.dir, seg_name(seg_id))
@@ -293,6 +298,49 @@ class SegmentLog:
         meta = self.segments.pop(seg_id, None)
         if meta:
             os.remove(meta.path)
+
+    def truncate_tail(self, keep_seq: int) -> None:
+        """截断链尾，只保留 seq <= keep_seq 的记录（回滚未提交批次）。
+
+        未提交批次的记录必然是链尾后缀（批次提交在元数据锁内串行，
+        不会与其他记录交错），因此：整段高于 keep_seq 的文件删除、
+        包含 keep_seq 的段截断到该记录为止，更低的段不动。
+        截断后重新 scan 重建索引；链尖摘要由调用方校验锚点后校准。
+        """
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+        self.active_id = None
+        doomed: list[int] = []
+        straddler: Optional[int] = None
+        for seg_id, meta in sorted(self.segments.items()):
+            if meta.first_seq > keep_seq:
+                doomed.append(seg_id)
+            elif meta.last_seq > keep_seq:
+                straddler = seg_id
+        for seg_id in doomed:
+            meta = self.segments.pop(seg_id)
+            remove_quiet(meta.path)
+        if straddler is not None:
+            meta = self.segments[straddler]
+            good = 0
+            with open(meta.path, "rb") as f:
+                for raw in f:
+                    if not raw.endswith(b"\n"):
+                        break
+                    try:
+                        rec = json.loads(raw.decode("utf-8"))
+                    except Exception:
+                        break
+                    if rec["seq"] > keep_seq:
+                        break
+                    good += len(raw)
+            with open(meta.path, "r+b") as f:
+                f.truncate(good)
+                f.flush()
+                os.fsync(f.fileno())
+        fsync_dirfd(self.dir)
+        self.scan()
 
     # ---------- 校验 ----------
 

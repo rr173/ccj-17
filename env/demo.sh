@@ -13,6 +13,25 @@ for i in $(seq 0 39); do
     -d "{\"type\":\"put\",\"payload\":{\"key\":\"k$((i%3))\",\"value\":$i}}" >/dev/null
 done
 
+echo "== 原子批次：创建 -> 分次加入 -> 提交（幂等键 order-42）=="
+BID=$(curl -fsS -XPOST "$BASE/batches" -H 'content-type: application/json' \
+  -d '{"idempotency_key":"order-42","ttl_ms":60000}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["batch_id"])')
+curl -fsS -XPOST "$BASE/batches/$BID/ops" -H 'content-type: application/json' \
+  -d '{"ops":[{"type":"put","payload":{"key":"bx","value":1}}]}' >/dev/null
+curl -fsS -XPOST "$BASE/batches/$BID/ops" -H 'content-type: application/json' \
+  -d '{"ops":[{"type":"put","payload":{"key":"by","value":2}},{"type":"delete","payload":{"key":"k0"}}]}' >/dev/null
+echo "提交前 state 中无 bx/by（不可见）："
+curl -fsS "$BASE/state" | python3 -c 'import sys,json;s=json.load(sys.stdin)["state"];print("bx" in s, "by" in s)'
+curl -fsS -XPOST "$BASE/batches/$BID/commit" | j
+echo "== 重复提交同幂等键同内容 -> 重放首次结果 =="
+BID2=$(curl -fsS -XPOST "$BASE/batches" -H 'content-type: application/json' \
+  -d '{"idempotency_key":"order-42","ttl_ms":60000}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["batch_id"])')
+curl -fsS -XPOST "$BASE/batches/$BID2/ops" -H 'content-type: application/json' \
+  -d '{"ops":[{"type":"put","payload":{"key":"bx","value":1}},{"type":"put","payload":{"key":"by","value":2}},{"type":"delete","payload":{"key":"k0"}}]}' >/dev/null
+curl -fsS -XPOST "$BASE/batches/$BID2/commit" | j
+echo "== 批次最终状态与序号范围 =="
+curl -fsS "$BASE/batches/$BID" | j
+
 echo "== 钉住读者 alice 于 seq 25，TTL 60s =="
 curl -fsS -XPOST "$BASE/readers/alice" -H 'content-type: application/json' \
   -d '{"pin_seq":25,"ttl_ms":60000}'; echo

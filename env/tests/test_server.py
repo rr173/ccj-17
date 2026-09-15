@@ -194,3 +194,93 @@ def test_restart_serves_last_boundary(tmp_path):
         assert bstate["state"] == {"k0": 27, "k1": 28, "k2": 29}
         st, rec = s.call("POST", "/append", {"type": "put", "payload": {"key": "z", "value": 1}})
         assert st == 201
+
+
+def test_batch_flow_http(tmp_path):
+    with Server(tmp_path, JANITOR_ENABLED="false") as s:
+        # 创建批次（带幂等键）
+        st, b = s.call("POST", "/batches", {"idempotency_key": "http-1", "ttl_ms": 60000})
+        assert st == 201 and b["status"] == "open"
+        bid = b["batch_id"]
+        # 分多次加入记录
+        st, b2 = s.call("POST", f"/batches/{bid}/ops",
+                        {"ops": [{"type": "put", "payload": {"key": "h1", "value": 1}}]})
+        assert st == 200 and b2["op_count"] == 1
+        st, b2 = s.call("POST", f"/batches/{bid}/ops",
+                        {"type": "delete", "payload": {"key": "h1"}})
+        assert st == 200 and b2["op_count"] == 2
+        st, b2 = s.call("POST", f"/batches/{bid}/ops",
+                        {"ops": [{"type": "put", "payload": {"key": "h2", "value": 2}}]})
+        assert b2["op_count"] == 3
+        # 提交前：业务状态与普通读取都看不到
+        st, stb = s.call("GET", "/state")
+        assert stb["state"] == {}
+        st, page = s.call("GET", "/read?from=1&limit=10")
+        assert page["records"] == []
+        # 提交：整批按加入顺序一次性可见
+        st, r = s.call("POST", f"/batches/{bid}/commit", {})
+        assert st == 200 and r["status"] == "committed" and r["replay"] is False
+        assert (r["first_seq"], r["last_seq"], r["record_count"]) == (1, 3, 3)
+        st, page = s.call("GET", "/read?from=1&limit=10")
+        assert [rec["type"] for rec in page["records"]] == ["put", "delete", "put"]
+        st, stb = s.call("GET", "/state")
+        assert stb["state"] == {"h2": 2}  # h1 先 put 后 delete
+        # 批次最终状态与序号范围可查询
+        st, v = s.call("GET", f"/batches/{bid}")
+        assert v["status"] == "committed" and (v["first_seq"], v["last_seq"]) == (1, 3)
+        # 同批次重复提交 -> 首次结果
+        st, r2 = s.call("POST", f"/batches/{bid}/commit", {})
+        assert r2["replay"] is True and r2["first_seq"] == 1
+        # 同幂等键不同内容 -> 409 冲突
+        st, b3 = s.call("POST", "/batches", {"idempotency_key": "http-1"})
+        bid3 = b3["batch_id"]
+        s.call("POST", f"/batches/{bid3}/ops",
+               {"ops": [{"type": "put", "payload": {"key": "h1", "value": 99}}]})
+        st, e = s.call("POST", f"/batches/{bid3}/commit", {})
+        assert st == 409 and e["error"] == "idempotency_conflict"
+        # 同幂等键相同内容 -> 重放首次结果
+        st, b4 = s.call("POST", "/batches", {"idempotency_key": "http-1"})
+        bid4 = b4["batch_id"]
+        s.call("POST", f"/batches/{bid4}/ops",
+               {"ops": [{"type": "put", "payload": {"key": "h1", "value": 1}},
+                        {"type": "delete", "payload": {"key": "h1"}},
+                        {"type": "put", "payload": {"key": "h2", "value": 2}}]})
+        st, r4 = s.call("POST", f"/batches/{bid4}/commit", {})
+        assert st == 200 and r4["replay"] is True and r4["first_seq"] == 1
+        st, stb = s.call("GET", "/status")
+        assert stb["tip_seq"] == 3  # 重放不占新序号
+        # 放弃后不能再提交
+        st, b5 = s.call("POST", "/batches", {})
+        bid5 = b5["batch_id"]
+        st, _ = s.call("POST", f"/batches/{bid5}/ops",
+                       {"ops": [{"type": "data", "payload": {"x": 1}}]})
+        st, ab = s.call("POST", f"/batches/{bid5}/abort", {})
+        assert st == 200 and ab["status"] == "aborted"
+        st, e = s.call("POST", f"/batches/{bid5}/commit", {})
+        assert st == 409 and e["error"] == "batch_aborted"
+        # 未知批次 404；空批次 400
+        st, e = s.call("GET", "/batches/b-nope")
+        assert st == 404
+        st, b6 = s.call("POST", "/batches", {})
+        st, e = s.call("POST", f"/batches/{b6['batch_id']}/commit", {})
+        assert st == 400 and e["error"] == "empty_batch"
+
+
+def test_batch_committed_survives_server_restart(tmp_path):
+    with Server(tmp_path, JANITOR_ENABLED="false") as s:
+        st, b = s.call("POST", "/batches", {"idempotency_key": "rst"})
+        bid = b["batch_id"]
+        s.call("POST", f"/batches/{bid}/ops",
+               {"ops": [{"type": "put", "payload": {"key": "z", "value": 7}}]})
+        st, r = s.call("POST", f"/batches/{bid}/commit", {})
+        assert r["first_seq"] == 1
+    # 重启：批次状态与幂等结果都还在
+    with Server(tmp_path, JANITOR_ENABLED="false") as s:
+        st, v = s.call("GET", f"/batches/{bid}")
+        assert v["status"] == "committed" and v["first_seq"] == 1
+        st, r = s.call("POST", f"/batches/{bid}/commit", {})
+        assert r["replay"] is True and r["first_seq"] == 1
+        st, page = s.call("GET", "/read?from=1&limit=10")
+        assert len(page["records"]) == 1
+        st, stb = s.call("GET", "/state")
+        assert stb["state"] == {"z": 7}

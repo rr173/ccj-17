@@ -128,6 +128,25 @@ class Handler(BaseHTTPRequestHandler):
                 if "type" not in b:
                     raise err(400, "bad_request", "append requires type")
                 return self._send(201, self.kernel.append(b["type"], b.get("payload")))
+            if route == ("batches", 1, "POST"):
+                b = self._body()
+                return self._send(201, self.kernel.create_batch(b.get("idempotency_key"), b.get("ttl_ms")))
+            if route == ("batches", 1, "GET"):
+                return self._send(200, self.kernel.list_batches())
+            if len(parts) == 2 and parts[0] == "batches" and method == "GET":
+                return self._send(200, self.kernel.batch_view(parts[1]))
+            if len(parts) == 3 and parts[0] == "batches" and parts[2] == "ops" and method == "POST":
+                b = self._body()
+                ops = b.get("ops")
+                if ops is None:
+                    if "type" not in b:
+                        raise err(400, "bad_request", "ops requires {ops:[...]} or a single {type, payload}")
+                    ops = [{"type": b["type"], "payload": b.get("payload")}]
+                return self._send(200, self.kernel.batch_add_ops(parts[1], ops))
+            if len(parts) == 3 and parts[0] == "batches" and parts[2] == "commit" and method == "POST":
+                return self._send(200, self.kernel.commit_batch(parts[1]))
+            if len(parts) == 3 and parts[0] == "batches" and parts[2] == "abort" and method == "POST":
+                return self._send(200, self.kernel.abort_batch(parts[1]))
             if route == ("read", 1, "GET"):
                 start = self._qs_int("from", 1, minimum=1)
                 limit = min(self._qs_int("limit", 100, minimum=1), 1000)
@@ -180,6 +199,8 @@ class Handler(BaseHTTPRequestHandler):
 
 _ENDPOINTS = [
     "POST /append", "GET /read?from=1&limit=100",
+    "POST /batches", "GET /batches", "GET /batches/{id}",
+    "POST /batches/{id}/ops", "POST /batches/{id}/commit", "POST /batches/{id}/abort",
     "GET /readers", "POST /readers[/{id}]", "POST /readers/{id}/heartbeat", "DELETE /readers/{id}",
     "GET /pins", "GET /state", "GET /head",
     "POST /compact", "GET /compact/result", "POST /compact/verify",

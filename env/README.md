@@ -2,9 +2,11 @@
 
 只追加的日志服务。旧段可以被压缩成 **快照 + 可校验清单（manifest）**，
 但严格遵守读者租约：任何读者钉住的序号及其所在段之前，一律不回收。
+写入支持 **带幂等键的原子批次**：分多次组装、整批提交、崩溃不留半批。
 
 * 零第三方依赖，仅 Python 3.11 标准库
 * 哈希链记录（防篡改），快照/清单自校验摘要 + 逐条段凭证 + 只追加审计链
+* 原子批次：提交前不可见、整批一次性可见、幂等键防重、崩溃只恢复成整批已提交/未提交
 * 读者登记、心跳续租、过期自动失效
 * 压缩双 Pass 校验 + 业务等价证明（完整重放 ≡ 快照 + 尾部重放）
 * 唯一提交点（原子指针替换），压缩中途崩溃/校验失败自动回到上一个完整边界
@@ -30,6 +32,7 @@
 │   └── audit.log               # 只追加审计链：每代 manifest 永久留痕
 └── state/
     ├── readers.json            # 读者租约（原子写，重启有效）
+    ├── batches.json            # 原子批次生命周期 + 幂等提交登记（原子写，重启有效）
     ├── compact-result.json     # 最近一次压缩结果（成功/失败/跳过原因）
     └── head.json               # 链头锚点 {seq, digest}：每次追加后原子更新
 ```
@@ -95,7 +98,54 @@
 
 ---
 
-## 3. 压缩协议（核心不变量）
+## 3. 原子批次与幂等提交
+
+调用方可以创建批次、分多次加入 `put`/`delete`/`data` 记录，再选择提交或放弃：
+
+```
+POST /batches                 {"idempotency_key"?, "ttl_ms"?}  -> 201 {batch_id, status:"open", ...}
+POST /batches/{id}/ops        {"ops":[{type,payload},...]} 或单条 {type,payload}
+POST /batches/{id}/commit     -> 200 {status:"committed", first_seq, last_seq, record_count, ...}
+POST /batches/{id}/abort      -> 200 {status:"aborted"}
+GET  /batches/{id}            -> 批次最终状态与日志序号范围（first_seq..last_seq）
+GET  /batches                 -> 全部批次摘要
+```
+
+**可见性**：未提交的批次只存在于 `state/batches.json`，普通读取（`/read`）
+与业务状态（`/state`）都看不到；提交时整批记录按加入顺序一次性入链
+（全程持元数据锁），读者要么看到整批、要么完全看不到。
+
+**幂等**（提交结果登记在 `batches.json` 的 `commits` 表，重启不失）：
+
+* 同一幂等键 + 相同内容（按加入顺序的操作列表摘要）重复提交
+  -> 返回第一次的结果（`replay: true`，含首次的序号范围），不重复入链；
+* 同一幂等键 + 不同内容 -> `409 idempotency_conflict`；
+* 同一批次被并发提交 -> 元数据锁串行化，只有一个提交真正生效，
+  其余拿到同一首次结果；未给幂等键时以批次 id 兜底，同批次重试仍幂等。
+
+**有效期**：批次创建时带 TTL（默认 `DEFAULT_TTL_MS`，上限 `MAX_TTL_MS`）。
+主动放弃（`abort`）或过期后：再提交返回 `409 batch_aborted` /
+`410 batch_expired`，且从未占用任何日志序号。
+
+**提交协议与崩溃恢复**（唯一提交点 = 幂等登记落盘）：
+
+```
+1. 批次置 committing 并落盘（记录 first_seq 与内容摘要）
+2. 整批记录按序追加到段日志（逐条 fsync）
+3. commits[key] = 提交结果并落盘        —— 唯一提交点
+4. 批次置 committed 并落盘
+```
+
+| 崩溃时机 | 恢复动作 |
+|---|---|
+| 第 1 步后、记录入链前/中 | 整批未提交：批次记录必是链尾后缀，截断回滚（跨段则删段），批次回到 `open` 可重试，不留序号空洞 |
+| 第 3 步（提交点）后 | 整批已提交：启动时补记批次状态；恢复后的重复提交仍返回原幂等结果 |
+
+运行期追加失败（如磁盘错误）同样整批回滚，不留半批。
+
+---
+
+## 4. 压缩协议（核心不变量）
 
 `POST /compact [{"force": true}]`。`force` 只绕过「可回收段数阈值」，
 **绝不绕过租约**。
@@ -142,11 +192,17 @@
 
 ---
 
-## 4. HTTP API
+## 5. HTTP API
 
 | 方法 路径 | 说明 |
 |---|---|
 | `POST /append` | `{type, payload}` → 返回 `{seq, prev, digest,...}` |
+| `POST /batches` | 创建原子批次 `{idempotency_key?, ttl_ms?}` → `{batch_id, status:"open",...}` |
+| `POST /batches/{id}/ops` | 分次加入记录 `{ops:[{type,payload},...]}`（或单条 `{type,payload}`） |
+| `POST /batches/{id}/commit` | 提交批次：整批一次性可见；幂等重放返回首次结果 |
+| `POST /batches/{id}/abort` | 放弃批次（之后不能再提交） |
+| `GET /batches/{id}` | 批次最终状态与日志序号范围 `first_seq..last_seq` |
+| `GET /batches` | 全部批次摘要 |
 | `GET /read?from=&limit=` | 读原始事件（压缩掉的序号 → `410 compacted`，附 `readable_from`） |
 | `GET /state` | **从头读取的业务含义**：快照状态+尾部重放，返回当前状态与摘要 |
 | `GET /head` | 当前 checkpoint 与可读起点 `readable_from` |
@@ -163,7 +219,7 @@
 | `GET /health` | 健康检查 |
 
 错误统一为 `{"error","message","details"}`，语义化状态码
-（400 参数 / 404 / 409 冲突或压缩忙 / 410 租约过期或序号已压缩 / 413 / 500）。
+（400 参数 / 404 / 409 冲突（幂等冲突、批次已放弃、压缩忙）/ 410 租约过期、批次过期或序号已压缩 / 413 / 500）。
 
 ### 快速试一下
 
@@ -172,6 +228,13 @@ python -m app                      # 默认 /data，:8080
 
 curl -s -XPOST localhost:8080/append -H 'content-type: application/json' \
   -d '{"type":"put","payload":{"key":"k0","value":1}}'
+# 原子批次：创建 -> 分次加入 -> 提交（可带幂等键）
+B=$(curl -s -XPOST localhost:8080/batches -H 'content-type: application/json' \
+  -d '{"idempotency_key":"order-42","ttl_ms":60000}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["batch_id"])')
+curl -s -XPOST localhost:8080/batches/$B/ops -H 'content-type: application/json' \
+  -d '{"ops":[{"type":"put","payload":{"key":"a","value":1}},{"type":"delete","payload":{"key":"k0"}}]}'
+curl -s -XPOST localhost:8080/batches/$B/commit     # 整批一次性可见；重复提交返回首次结果
+curl -s localhost:8080/batches/$B                   # 批次最终状态与序号范围
 # 多写一些、滚动段之后：
 curl -s -XPOST localhost:8080/readers/alice -H 'content-type: application/json' \
   -d '{"pin_seq":100,"ttl_ms":60000}'
@@ -184,7 +247,7 @@ curl -s localhost:8080/state
 
 ---
 
-## 5. Docker 部署
+## 6. Docker 部署
 
 ```bash
 docker build -t append-only-log .
@@ -218,7 +281,7 @@ docker compose logs -f
 
 ---
 
-## 6. 测试
+## 7. 测试
 
 ```bash
 python tests/run_tests.py          # 无 pytest 环境（标准库垫片运行器）
@@ -231,7 +294,11 @@ python -m pytest -q
 凭证追溯原始段、篡改段/篡改快照导致失败并完全回滚、
 活动段尾部篡改/截断被链头锚点拒绝（重启拒绝启动、校验失败）、
 同进程多任务与跨进程 flock 互斥、四个压缩阶段的断电恢复、
+原子批次（提交前不可见、整批有序可见、幂等重放/冲突、并发单胜者、
+放弃与过期、跨段回滚、三个提交阶段的断电恢复、重启后幂等结果保持）、
 HTTP 端到端（含 janitor 在钉位保护下不误删、释放后自动压缩、重启边界）。
 
 `CRASH_HOOK={after_fold|after_write|after_verify|after_switch}`
-可让进程在压缩对应阶段 `os._exit(99)`，用于灾难演练。
+可让进程在压缩对应阶段 `os._exit(99)`；
+`CRASH_HOOK={batch_after_mark|batch_after_append|batch_after_register}`
+可让进程在批次提交对应阶段崩溃，用于灾难演练。
