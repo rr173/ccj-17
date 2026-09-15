@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .common import Error, canonical, err
 from .kernel import Config, Kernel
+from .replication import LeaseRefresher, Replicator
 
 MAX_BODY = 4 * 1024 * 1024
 
@@ -20,6 +21,22 @@ MAX_BODY = 4 * 1024 * 1024
 def _env_bool(name: str, default: bool) -> bool:
     v = os.environ.get(name)
     return default if v is None else v.lower() in ("1", "true", "yes", "on")
+
+
+def _env_peers() -> dict[str, str]:
+    """PEERS=nid1=http://host:port,nid2=http://host:port"""
+    raw = os.environ.get("PEERS", "").strip()
+    peers: dict[str, str] = {}
+    if raw:
+        for item in raw.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "=" not in item:
+                raise ValueError("PEERS entries must be node_id=base_url")
+            nid, url = item.split("=", 1)
+            peers[nid.strip()] = url.strip().rstrip("/")
+    return peers
 
 
 def build_config() -> Config:
@@ -32,6 +49,17 @@ def build_config() -> Config:
         janitor_interval_ms=int(os.environ.get("JANITOR_INTERVAL_MS", 5_000)),
         compaction_min_segments=int(os.environ.get("COMPACTION_MIN_SEGMENTS", 4)),
         crash_hook=os.environ.get("CRASH_HOOK") or None,
+        node_id=os.environ.get("NODE_ID") or None,
+        bootstrap_role=os.environ.get("BOOTSTRAP_ROLE", "primary"),
+        peers=_env_peers(),
+        bootstrap_voters=(
+            [v.strip() for v in os.environ["BOOTSTRAP_VOTERS"].split(",") if v.strip()]
+            if os.environ.get("BOOTSTRAP_VOTERS") else None),
+        grant_ttl_ms=int(os.environ.get("GRANT_TTL_MS", 10_000)),
+        lease_interval_ms=int(os.environ.get("LEASE_INTERVAL_MS", 2_000)),
+        replication_interval_ms=int(os.environ.get("REPLICATION_INTERVAL_MS", 500)),
+        replication_batch=int(os.environ.get("REPLICATION_BATCH", 500)),
+        replica_source=(os.environ.get("REPLICA_SOURCE", "").strip() or None),
     )
 
 
@@ -47,9 +75,12 @@ class Janitor(threading.Thread):
         interval = max(0.5, self.k.cfg.janitor_interval_ms / 1000)
         while not self.stop_evt.wait(interval):
             try:
+                # 备库不自行压缩：边界随复制从主库安装
+                if self.k.cluster.role != "primary":
+                    continue
                 self.k.compact()
             except Error:
-                pass  # 409 busy 等；结果已可在 /compact/result 查询
+                pass  # 409 busy / 403 非主等；结果已可在 /compact/result 查询
             except Exception:
                 pass
 
@@ -181,6 +212,48 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, self.kernel.verify_latest())
             if route == ("audit", 1, "GET"):
                 return self._send(200, {"audit": self.kernel.checkpoints.read_audit()})
+            # ---------- 主备复制 / 故障切换 ----------
+            if route == ("replica", 1, "POST"):
+                b = self._body()
+                return self._send(200, self.kernel.configure_replica(b["peer_url"]))
+            if len(parts) == 2 and parts[0] == "replica" and parts[1] == "stop" and method == "POST":
+                return self._send(200, self.kernel.stop_replica())
+            if len(parts) == 2 and parts[0] == "replica" and parts[1] == "reset" and method == "POST":
+                return self._send(200, self.kernel.reset_replica())
+            if len(parts) == 2 and parts[0] == "replica" and parts[1] == "cycle" and method == "POST":
+                return self._send(200, self.kernel.run_replication_cycle())
+            if route == ("replica", 1, "GET"):
+                return self._send(200, self.kernel.replication_view())
+            if len(parts) == 2 and parts[0] == "replica" and parts[1] == "boundary" and method == "GET":
+                return self._send(200, self.kernel.export_boundary())
+            if len(parts) == 2 and parts[0] == "replica" and parts[1] == "records" and method == "GET":
+                qs = self._qs()
+                start = self._qs_int("from", 0, minimum=0)
+                if start <= 0:
+                    raise err(400, "bad_query", "from must be >= 1")
+                limit = min(self._qs_int("limit", 500, minimum=1), 5000)
+                term = int(qs.get("term", ["0"])[0] or 0)
+                return self._send(200, self.kernel.export_records(start, limit, term))
+            if len(parts) == 2 and parts[0] == "replica" and parts[1] == "snapshot" and method == "GET":
+                gen = self._qs_int("gen", 0, minimum=0)
+                term = int(self._qs().get("term", ["0"])[0] or 0)
+                return self._send(200, self.kernel.export_snapshot(gen, term))
+            if len(parts) == 2 and parts[0] == "cluster" and parts[1] == "request_vote" and method == "POST":
+                return self._send(200, self.kernel.handle_request_vote(self._body()))
+            if len(parts) == 2 and parts[0] == "cluster" and parts[1] == "lease" and method == "POST":
+                term = int(self._qs().get("term", ["0"])[0] or 0)
+                return self._send(200, self.kernel.handle_lease_ack(term))
+            if len(parts) == 2 and parts[0] == "cluster" and parts[1] == "grant" and method == "POST":
+                b = self._body()
+                return self._send(200, self.kernel.renew_grant(b.get("ttl_ms")))
+            if len(parts) == 2 and parts[0] == "cluster" and parts[1] == "stepdown" and method == "POST":
+                return self._send(200, self.kernel.stepdown())
+            if len(parts) == 2 and parts[0] == "cluster" and parts[1] == "promote" and method == "POST":
+                b = self._body()
+                return self._send(200, self.kernel.campaign(
+                    term=b.get("term"), grant_ttl_ms=b.get("ttl_ms"),
+                    voter_urls=b.get("voters"),
+                    min_catch_up_seq=b.get("required_seq")))
             if route == ("status", 1, "GET"):
                 return self._send(200, self.kernel.status())
             if route == ("health", 1, "GET"):
@@ -205,6 +278,13 @@ _ENDPOINTS = [
     "GET /pins", "GET /state", "GET /head",
     "POST /compact", "GET /compact/result", "POST /compact/verify",
     "GET /audit", "GET /status", "GET /health",
+    "GET /replica", "POST /replica {peer_url}", "POST /replica/cycle",
+    "POST /replica/stop", "POST /replica/reset",
+    "GET /replica/boundary", "GET /replica/records?from=&term=",
+    "GET /replica/snapshot?gen=&term=",
+    "POST /cluster/promote {term?,ttl_ms?,voters?,required_seq?}",
+    "POST /cluster/stepdown", "POST /cluster/grant {ttl_ms?}",
+    "POST /cluster/request_vote", "POST /cluster/lease?term=",
 ]
 
 
@@ -216,15 +296,29 @@ def main() -> None:
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8080"))
     httpd = ThreadingHTTPServer((host, port), Handler)
+    bg = []
     janitor = Janitor(kernel) if cfg.janitor_enabled else None
     if janitor:
         janitor.start()
-    print(f"append-only log listening on {host}:{port}; recovery={json.dumps(recovery, ensure_ascii=False)}")
+        bg.append(janitor)
+    # 备库后台拉取；多节点主库授权续租心跳（拿不到多数派则不续期，
+    # TTL 过后写入被门控拒绝；发现更高任期则授权失效、线程退出）
+    if kernel.cluster.role == "standby":
+        rep = Replicator(kernel, cfg.replication_interval_ms)
+        rep.start()
+        bg.append(rep)
+    elif cfg.peers:
+        refresher = LeaseRefresher(kernel, cfg.lease_interval_ms, cfg.grant_ttl_ms)
+        refresher.start()
+        bg.append(refresher)
+    print(f"append-only log listening on {host}:{port}; "
+          f"role={kernel.cluster.role} term={kernel.cluster.term} "
+          f"recovery={json.dumps(recovery, ensure_ascii=False)}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        if janitor:
-            janitor.stop()
+        for t in bg:
+            t.stop()
         httpd.server_close()

@@ -1,8 +1,10 @@
-# append-only-log —— 可压缩、租约保护、可校验的追加日志
+# append-only-log —— 可压缩、租约保护、可校验、可主备切换的追加日志
 
 只追加的日志服务。旧段可以被压缩成 **快照 + 可校验清单（manifest）**，
 但严格遵守读者租约：任何读者钉住的序号及其所在段之前，一律不回收。
 写入支持 **带幂等键的原子批次**：分多次组装、整批提交、崩溃不留半批。
+支持 **主备复制与故障切换**：备实例从主实例建立复制（一致边界 + 顺序增量），
+提升使用单调递增任期与带有效期的授权，分叉历史被明确拒绝。
 
 * 零第三方依赖，仅 Python 3.11 标准库
 * 哈希链记录（防篡改），快照/清单自校验摘要 + 逐条段凭证 + 只追加审计链
@@ -11,6 +13,8 @@
 * 压缩双 Pass 校验 + 业务等价证明（完整重放 ≡ 快照 + 尾部重放）
 * 唯一提交点（原子指针替换），压缩中途崩溃/校验失败自动回到上一个完整边界
 * 压缩互斥（线程锁 + `flock`）：多个压缩任务只有一个能改变可见结果
+* 主备复制：一致快照边界原子安装、增量逐条摘要链校验、重复段不重复应用、
+  已确认位置分叉停在 conflict；故障切换任期单调、授权 TTL、每任期多数派单胜者
 * 提供 Docker / docker-compose 部署
 
 ---
@@ -34,7 +38,9 @@
     ├── readers.json            # 读者租约（原子写，重启有效）
     ├── batches.json            # 原子批次生命周期 + 幂等提交登记（原子写，重启有效）
     ├── compact-result.json     # 最近一次压缩结果（成功/失败/跳过原因）
-    └── head.json               # 链头锚点 {seq, digest}：每次追加后原子更新
+    ├── head.json               # 链头锚点 {seq, digest}：每次追加后原子更新
+    ├── cluster.json            # 集群角色/单调任期/带 TTL 授权/每任期投票（重启有效）
+    └── replica.json            # 复制关系、已确认序号/摘要、来源边界、最近错误
 ```
 
 ### 1.1 记录哈希链
@@ -215,7 +221,19 @@ GET  /batches                 -> 全部批次摘要
 | `GET /compact/result` | **最近一次压缩结果**（成功/失败阶段/等价证明/跳过原因） |
 | `POST /compact/verify` | 重新复核当前边界，返回逐项 checks |
 | `GET /audit` | 压缩审计链 |
-| `GET /status` | 总览：段、租约、钉位、checkpoint、压缩状态 |
+| `GET /replica` | **复制/集群总览**：phase（syncing/caught_up/conflict/grant_invalid/writable_primary）、角色、任期、授权、已同步序号、来源边界、延迟、最近错误 |
+| `POST /replica` | 备实例指定来源 `{peer_url}`（须为 standby） |
+| `POST /replica/cycle` | 手动触发一次拉取周期（返回 applied/installed_snapshot/status） |
+| `POST /replica/stop` / `POST /replica/reset` | 停止跟随 / 冲突后人工重置（冲突不能自动恢复） |
+| `GET /replica/boundary` | （复制协议）主导出任期、tip 与当前 checkpoint 边界 |
+| `GET /replica/records?from=&limit=&term=` | （复制协议）导出增量记录（已压缩序号 → 410 snapshot_required） |
+| `GET /replica/snapshot?gen=&term=` | （复制协议）导出完整边界（snapshot+manifest+pointer） |
+| `POST /cluster/promote` | 备实例竞选提升：`{term?, ttl_ms?, voters?, required_seq?}` |
+| `POST /cluster/stepdown` | 当前主主动交接（授权立即失效、降为备） |
+| `POST /cluster/grant` | 授权续租 `{ttl_ms?}`（过期后不能续，必须重新竞选） |
+| `POST /cluster/request_vote` | （选举协议）候选拉票：每任期持久化最多一票 |
+| `POST /cluster/lease?term=` | （租约协议）主任期心跳；见更高任期的节点自动让位 |
+| `GET /status` | 总览：段、租约、钉位、checkpoint、压缩状态、cluster/replication |
 | `GET /health` | 健康检查 |
 
 错误统一为 `{"error","message","details"}`，语义化状态码
@@ -247,7 +265,119 @@ curl -s localhost:8080/state
 
 ---
 
-## 6. Docker 部署
+## 6. 主备复制与故障切换
+
+角色只有两种：**primary（主）** 与 **standby（备）**。备实例只接受读与
+复制，写入（`/append`、原子批次、压缩）一律 `403 not_primary`。集群
+状态持久化在 `state/cluster.json`（任期、授权、投票），复制进度持久化在
+`state/replica.json`（已确认序号/摘要、来源边界、最近错误）。
+
+### 6.1 建立复制：一致边界 + 顺序增量
+
+```
+# 备实例（BOOTSTRAP_ROLE=standby 启动后，或运行时）：
+POST /replica   {"peer_url": "http://primary:8080"}
+# 后台线程按 REPLICATION_INTERVAL_MS 自动拉取；也可手动：
+POST /replica/cycle
+```
+
+每个拉取周期：
+
+1. `GET /replica/boundary` 得到来源当前任期、tip 与 checkpoint 边界
+   （**一致的起点**）；来源任期低于本地任期 -> 明确拒绝 `stale_term`。
+2. 备库没有同一代边界、或已确认位置没有越过来源边界时，先
+   `GET /replica/snapshot` 安装完整边界；否则直接增量。
+3. `GET /replica/records?from=synced+1` 顺序应用增量。
+
+增量应用的校验（`apply_records`）：
+
+* **顺序**：每条记录必须是 `synced_seq+1`；
+* **摘要链**：`prev` 必须等于已确认位置摘要，重算 `digest` 必须一致；
+* **去重**：序号 `<= synced` 的重复段逐条与本地摘要比对，相同才跳过
+  （**绝不重复应用**），不同即冲突。
+* 每条记录 fsync 后才前滚 `synced_seq` 并原子落盘；中断重启从已确认
+  位置继续（记录已 fsync、进度未落盘的窗口在启动时重放对账前滚）。
+* 若本地历史与来源在已同步位置分叉（`prev` 不符、重复段摘要不同、
+  快照凭证在已确认点不一致）：**停在 `conflict`**，不静默覆盖、
+  不继续提供错误结果、禁止提升；只有显式 `POST /replica/reset`
+  才能离开冲突。
+
+### 6.2 全量边界安装的原子性
+
+快照安装与压缩使用同一套「临时目录 + 唯一提交点」协议：
+
+```
+1. 复核 envelope 自校验、snapshot/manifest/pointer 互链、状态摘要、
+   与本地已确认历史的分叉检查
+2. 完整写入 gen-N.tmp.* 并 fsync，再原子 rename      [snapshot_after_verify / snapshot_after_write]
+3. audit 留痕 + current.json 原子替换（唯一提交点）  [snapshot_after_switch]
+4. 删除边界覆盖的本地旧前缀；崩溃则启动时凭 pending_prefix 幂等补做
+```
+
+| 崩溃时机 | 重启后 |
+|---|---|
+| 第 2 步完成前 | 临时目录被清除，仍是**安装前的完整状态** |
+| 第 3 步（提交点）后、前缀清理中 | 新边界已完整可见，幂等补删前缀，**不会快照与增量各一半** |
+
+备库落后太多（需要的序号已被主压缩）时，复制状态机自动重装当前边界后再追；
+重启恢复后继续逐条校验顺序与摘要链。
+
+### 6.3 任期、授权与故障切换
+
+* **单调任期（term）**：本地见到任何更高任期立即前滚；旧任期的写入、
+  复制数据、拉票请求一律 `stale_term` 拒绝。
+* **带有效期的授权（grant）**：只有 `role=primary` 且
+  `grant_expires_at > now` 的实例接受新写入；过期 -> `403 grant_expired`，
+  且不能续租（`/cluster/grant`），必须以更高任期重新竞选成功才能再写。
+  多节点主由后台 `LeaseRefresher` 向成员发任期心跳，**拿到多数派确认才
+  续期**；联系不到多数派时授权到期自动不可写。
+* **每个任期最多一个胜者**：投票（voted_for）持久化，重启不重置。
+  候选先获得多数成员的投票承诺，再落自选票就任；同一任期两个候选并发
+  申请时最多一个凑齐多数（另一候选拿到 `already_voted`/`leader_valid`
+  拒绝，`election_lost`）。当前主授权有效时拒绝任何让位投票；
+  优雅切换先 `POST /cluster/stepdown`。
+* **未追平不提升**：竞选时 `synced_seq` 必须达到来源 tip
+  （或显式 `required_seq`）；从未联系过来源、处于冲突态也禁止提升。
+  投票方还会比较日志新旧（tip seq/摘要），日志落后的候选拿不到票。
+* **旧主不能复活**：提升成功后，旧主角色已是备（stepdown 或收到更高
+  任期心跳），其旧任期写入被 `not_primary`/`grant_expired` 拒绝、
+  旧任期复制数据被 `stale_term` 拒绝；授权过期或进程重启都不会让旧
+  任期重新生效（cluster.json 落盘恢复）。
+
+### 6.4 状态接口
+
+`GET /replica` 的 `phase`：
+
+| phase | 含义 |
+|---|---|
+| `syncing` | 备实例正在安装边界或追赶增量（含可重试的传输错误） |
+| `caught_up` | 备实例已追平来源 tip |
+| `conflict` | 已同步位置分叉，冻结：不复制、不提升，等待人工 reset |
+| `writable_primary` | 主且授权有效，可接受写入 |
+| `grant_invalid` | 主角色但授权过期/缺失，不可写，需要重新竞选 |
+
+同响应给出：角色、term、授权剩余毫秒、`synced_seq`/`synced_digest`、
+来源边界（term/tip/checkpoint）、`lag_ms`、`last_error`。
+
+### 6.5 典型两节点切换（HTTP）
+
+```bash
+# 主 P 以 :8080 启动；备 S：
+PORT=8081 BOOTSTRAP_ROLE=standby NODE_ID=S \
+  PEERS="P=http://127.0.0.1:8080,S=http://127.0.0.1:8081" \
+  REPLICA_SOURCE=http://127.0.0.1:8080 python -m app
+curl -sXPOST localhost:8081/replica -H 'content-type: application/json' \
+  -d '{"peer_url":"http://127.0.0.1:8080"}'
+curl -s localhost:8081/replica       # 观察 phase: syncing -> caught_up
+# 切换：主交接 -> 备竞选更高任期（voters 为多数派成员集合）
+curl -s -XPOST localhost:8080/cluster/stepdown
+curl -s -XPOST localhost:8081/cluster/promote -H 'content-type: application/json' \
+  -d '{"term":2,"ttl_ms":30000,"voters":["http://127.0.0.1:8080","http://127.0.0.1:8081"]}'
+```
+
+---
+
+## 7. Docker 部署
 
 ```bash
 docker build -t append-only-log .
@@ -272,16 +402,25 @@ docker compose logs -f
 | `DEFAULT_TTL_MS` | `30000` | 租约默认时长 |
 | `MAX_TTL_MS` | `86400000` | 单次续租上限（1d~24h，最小 1000ms） |
 | `COMPACTION_MIN_SEGMENTS` | `4` | janitor 自动压缩所需最少可回收 sealed 段 |
-| `JANITOR_ENABLED` | `true` | 后台自动压缩线程 |
+| `JANITOR_ENABLED` | `true` | 后台自动压缩线程（仅主实例实际压缩） |
 | `JANITOR_INTERVAL_MS` | `5000` | janitor 轮询间隔 |
+| `NODE_ID` | 自动生成 | 节点标识（写入 `state/cluster.json`，不可变更） |
+| `BOOTSTRAP_ROLE` | `primary` | 数据目录首次初始化角色：`primary`/`standby`（重启后以落盘角色为准） |
+| `PEERS` | 空 | `node_id=base_url,...` 选举/租约成员地址 |
+| `BOOTSTRAP_VOTERS` | 空 | 首次自举时持久化的选举成员 node_id 列表 |
+| `REPLICA_SOURCE` | 空 | 以 standby 首次引导时的来源主 URL（之后可 `POST /replica` 改） |
+| `GRANT_TTL_MS` | `10000` | 竞选成功获得的授权有效期（上限 5 分钟） |
+| `LEASE_INTERVAL_MS` | `2000` | 多节点主授权续租心跳间隔 |
+| `REPLICATION_INTERVAL_MS` | `500` | 备库拉取周期 |
+| `REPLICATION_BATCH` | `500` | 单页增量记录上限 |
 
 > 压缩期间持有元数据锁，会短暂阻塞追加（默认小段配置下为毫秒~亚秒级）。
-> 服务定位为单副本 + 持久卷；多副本共享卷时 `flock` 保证压缩互斥，
-> 但读者租约仍以单一主副本写入为准。
+> 主备部署使用**各自独立的数据卷**；压缩互斥的 `flock` 针对同一数据目录，
+> 主备之间的一致性由复制协议（快照边界 + 哈希链增量）保证。
 
 ---
 
-## 7. 测试
+## 8. 测试
 
 ```bash
 python tests/run_tests.py          # 无 pytest 环境（标准库垫片运行器）
@@ -296,9 +435,23 @@ python -m pytest -q
 同进程多任务与跨进程 flock 互斥、四个压缩阶段的断电恢复、
 原子批次（提交前不可见、整批有序可见、幂等重放/冲突、并发单胜者、
 放弃与过期、跨段回滚、三个提交阶段的断电恢复、重启后幂等结果保持）、
-HTTP 端到端（含 janitor 在钉位保护下不误删、释放后自动压缩、重启边界）。
+HTTP 端到端（含 janitor 在钉位保护下不误删、释放后自动压缩、重启边界），
+以及主备复制与故障切换：
+
+* 初始一致边界 + 增量追平、角色/序号/来源边界/延迟/最近错误状态
+* 中断后从已确认位置继续、重复段不重复应用
+* 已同步位置分叉（增量/重复段/快照凭证）停在 conflict、冻结、禁止提升
+* 全新备库装快照、落后自动重装边界、原子批次整批到达
+* 快照安装三个阶段（复核后/写完/指针切换后）断电：只剩旧完整态或完整新态
+* 记录已 fsync、进度未落盘的重启对账（不丢、不重）
+* 授权 TTL 写门控、未追平不提升、有效主拒绝让位、stepdown 后提升、
+  同任期多数派单胜者、旧主旧任期写入/拉票/复制数据被拒、
+  授权过期不可写不可续、重启不复活旧任期、备见到更高任期前滚
+* 真实 HTTP 双进程复制、交接、提升与备进程重启续传
 
 `CRASH_HOOK={after_fold|after_write|after_verify|after_switch}`
 可让进程在压缩对应阶段 `os._exit(99)`；
 `CRASH_HOOK={batch_after_mark|batch_after_append|batch_after_register}`
-可让进程在批次提交对应阶段崩溃，用于灾难演练。
+可让进程在批次提交对应阶段崩溃；
+`CRASH_HOOK={snapshot_after_verify|snapshot_after_write|snapshot_after_switch}`
+可让进程在备库安装快照边界的对应阶段崩溃，用于灾难演练。

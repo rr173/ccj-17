@@ -147,7 +147,9 @@ class SegmentLog:
             )
         if self.segments:
             active_id = ids[-1]
-            # 最高编号文件为空（崩溃于滚动后）：补一个空活动段索引
+            # 最高编号文件为空（崩溃于滚动后/快照安装后尚无增量）：
+            # 补一个空活动段索引；其链尖锚点由 Kernel._sync_tip 从
+            # checkpoint/已确认位置校准，这里先置 GENESIS。
             if active_id not in self.segments:
                 path = os.path.join(self.dir, seg_name(active_id))
                 prior = self.segments[max(self.segments)]
@@ -157,10 +159,27 @@ class SegmentLog:
             self._open_active(active_id)
             active = self.segments[active_id]
             self.next_seq = active.last_seq + 1
-            # _last_digest 由 Kernel 在校验跨段锚点后校准；这里先取活动段尾
-            self._last_digest = self._tail_digest(active_id)
+            if active.count:
+                # _last_digest 由 Kernel 依据 checkpoint 锚点复核；这里先取活动段尾
+                self._last_digest = self._tail_digest(active_id)
+            else:
+                # 空活动段（滚动后未写 / 快照安装后尚无增量）：
+                # 取前一段尾摘要，保证 verify_chain_from 能正确跨段
+                prior = [i for i in self.segments if i < active_id]
+                self._last_digest = self._tail_digest(max(prior)) if prior else GENESIS
         else:
             self._open_active(1)
+
+    def anchor_empty_active(self, base_seq: int, anchor: str) -> None:
+        """scan 后把空活动段的游标锚定到快照边界 {base_seq, anchor}。"""
+        if self.active_id is None:
+            self._open_active(1)
+        assert self.active_id is not None
+        self.next_seq = base_seq + 1
+        self._last_digest = anchor
+        meta = self.segments[self.active_id]
+        self.segments[self.active_id] = SegMeta(
+            meta.seg_id, meta.path, base_seq + 1, base_seq, 0, meta.size, False)
 
     def _tail_digest(self, seg_id: int) -> str:
         recs = list(self.iter_segment(seg_id))
@@ -291,6 +310,129 @@ class SegmentLog:
             if meta.first_seq > seq:
                 return cand
         return None
+
+    # ---------- 备库复制：在指定序号精确续接 ----------
+
+    def import_records(self, records: list[dict]) -> None:
+        """把来源记录按序精确追加到本地链（复制专用）。
+
+        每条记录必须满足：seq 紧接本地 tip+1、prev == 本地链尖摘要、
+        重算 digest 一致。任何一条不满足立即抛错且已写内容被截断回滚，
+        绝不写入半截。调用方（Kernel）负责重复段跳过与冲突判定。
+        """
+        if not records:
+            return
+        start_seq = self.next_seq
+        for rec in records:
+            if int(rec["seq"]) != self.next_seq or rec.get("prev") != self._last_digest:
+                raise err(409, "replication_conflict",
+                          "source record does not extend the local chain",
+                          expected_seq=self.next_seq, got_seq=rec.get("seq"))
+            d = record_digest(rec)
+            if d != rec.get("digest"):
+                raise err(409, "replication_conflict", "record digest mismatch",
+                          seq=rec["seq"])
+            if rec.get("type") not in VALID_TYPES:
+                raise err(409, "replication_conflict", "unknown record type",
+                          seq=rec["seq"])
+            assert self._fh is not None
+            self._fh.write(record_line({k: rec[k] for k in ("seq", "ts", "type", "payload", "prev")}))
+            self._fh.flush()
+            os.fsync(self._fh.fileno())
+            self._on_appended(rec, d, self.next_seq)
+        # 整批落盘后按需滚动（与主库滚动大小对齐由调用方决定，这里统一不滚动：
+        # 活动段由本地后续追加在写满时自然滚动）
+
+    def _on_appended(self, rec: dict, d: str, seq_before: int) -> None:
+        assert self.active_id is not None
+        meta = self.segments[self.active_id]
+        line = record_line({k: rec[k] for k in ("seq", "ts", "type", "payload", "prev")})
+        self.segments[self.active_id] = SegMeta(
+            meta.seg_id, meta.path, meta.first_seq, rec["seq"],
+            meta.count + 1, meta.size + len(line), sealed=False,
+        )
+        self.next_seq = rec["seq"] + 1
+        self._last_digest = d
+
+    def reset_anchor(self, base_seq: int, anchor: str) -> None:
+        """丢弃全部本地段，把链游标锚定到 {base_seq, anchor}（快照全量安装）。
+
+        安装快照且本地不存在边界之后的尾部记录时调用：下一条导入记录必须
+        是 seq == base_seq+1、prev == anchor。目录中不保留任何旧段文件。
+        """
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+        for name in os.listdir(self.dir):
+            if parse_seg_name(name) is not None:
+                remove_quiet(os.path.join(self.dir, name))
+        self.segments.clear()
+        self.active_id = None
+        self.next_seq = base_seq + 1
+        self._last_digest = anchor
+        fsync_dirfd(self.dir)
+        self._open_active(1)
+        # 空活动段代表「锚点位于 base_seq」：tip 必须报 base_seq 而非 -1
+        self.segments[self.active_id] = SegMeta(
+            self.active_id, self.segments[self.active_id].path,
+            base_seq + 1, base_seq, 0, 0, sealed=False)
+
+    def truncate_prefix_in_segment(self, keep_from_seq: int, anchor_digest: str) -> int:
+        """就地丢弃 keep_from_seq 之前的记录（快照边界安装后清理前缀）。
+
+        整段严格位于边界之前的文件直接删除；跨边界段重写，只保留
+        seq >= keep_from_seq 的记录（保留部分第一条的 prev 必须是快照
+        tail_anchor）。不调用 scan（启动恢复期间索引由外层 scan 建立）。
+        返回保留尾部所在的段 id（无尾部返回 -1）。
+        """
+        if not self.segments:
+            return -1
+        straddle_id = None
+        doomed: list[int] = []
+        for seg_id, meta in sorted(self.segments.items()):
+            if meta.count == 0:
+                continue  # 空活动段：保留（可能正是安装后的新活动段）
+            if meta.last_seq < keep_from_seq:
+                doomed.append(seg_id)
+            elif meta.first_seq < keep_from_seq <= meta.last_seq + 1:
+                straddle_id = seg_id
+                break
+        for seg_id in doomed:
+            if seg_id == self.active_id:
+                continue  # 活动段走 straddle 重写路径
+            self.delete_segment(seg_id)
+        if straddle_id is None:
+            return -1
+        meta = self.segments[straddle_id]
+        kept: list[bytes] = []
+        for rec in self.iter_segment(straddle_id):
+            if rec["seq"] >= keep_from_seq:
+                if not kept and rec["prev"] != anchor_digest:
+                    raise err(409, "replication_conflict",
+                              "kept tail does not link to installed snapshot anchor")
+                kept.append(record_line(
+                    {k: rec[k] for k in ("seq", "ts", "type", "payload", "prev")}))
+        if self._fh is not None and self.active_id == straddle_id:
+            self._fh.close()
+            self._fh = None
+        if kept:
+            tmp = f"{meta.path}.rewrite.{os.urandom(4).hex()}"
+            with open(tmp, "wb") as f:
+                for line in kept:
+                    f.write(line)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, meta.path)
+            size = sum(len(x) for x in kept)
+            self.segments[straddle_id] = SegMeta(
+                straddle_id, meta.path, keep_from_seq,
+                keep_from_seq + len(kept) - 1, len(kept), size,
+                sealed=straddle_id != self.active_id)
+            fsync_dirfd(self.dir)
+            return straddle_id
+        remove_quiet(meta.path)
+        fsync_dirfd(self.dir)
+        return -1
 
     # ---------- 删除 ----------
 

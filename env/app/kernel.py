@@ -13,10 +13,9 @@ from __future__ import annotations
 
 import dataclasses
 import fcntl
-import json
 import os
 import threading
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from .batches import ABORTED, COMMITTED, COMMITTING, EXPIRED, OPEN, Batch, BatchStore, ops_hash
 from .checkpoints import (
@@ -25,6 +24,12 @@ from .checkpoints import (
     MANIFEST,
     SNAPSHOT,
     open_doc,
+)
+from .cluster import (
+    MAX_GRANT_TTL_MS,
+    PRIMARY,
+    STANDBY,
+    ClusterStore,
 )
 from .common import (
     GENESIS,
@@ -41,7 +46,8 @@ from .common import (
 )
 from .readers import ReaderStore
 from .reducer import Reducer
-from .segment import SegmentLog
+from .replica import CAUGHT_UP, CONFLICT, IDLE, SYNCING, ReplicaStore
+from .segment import SegmentLog, record_digest
 
 
 @dataclasses.dataclass
@@ -54,6 +60,16 @@ class Config:
     janitor_interval_ms: int = 5_000
     compaction_min_segments: int = 4    # 后台压缩阈值
     crash_hook: Optional[str] = None    # 测试用：在某阶段 os._exit
+    # ---- 集群 / 主备复制 ----
+    node_id: Optional[str] = None       # 不显式配置则生成并持久化
+    bootstrap_role: str = PRIMARY       # 数据目录首次初始化时的角色
+    peers: dict[str, str] = dataclasses.field(default_factory=dict)  # node_id -> base_url
+    bootstrap_voters: Optional[list[str]] = None  # 首次启动的选举成员
+    grant_ttl_ms: int = 10_000          # 主授权有效期
+    lease_interval_ms: int = 2_000      # 授权续租心跳间隔
+    replication_interval_ms: int = 500  # 备库拉取间隔
+    replication_batch: int = 500        # 单次拉取记录上限
+    replica_source: Optional[str] = None  # 首次以 standby 引导时的来源 URL
 
 
 def _vfail(reason: Any, proof: dict | None = None) -> dict:
@@ -76,6 +92,27 @@ class Kernel:
         self.readers = ReaderStore(os.path.join(self.state_dir, "readers.json"))
         self.batches = BatchStore(os.path.join(self.state_dir, "batches.json"))
         self.checkpoints = Checkpointer(self.cp_dir, os.path.join(self.cp_dir, AUDIT))
+
+        # ---- 集群角色 / 任期授权 / 复制进度 ----
+        self.cluster = ClusterStore(
+            os.path.join(self.state_dir, "cluster.json"),
+            cfg.node_id,
+            list(cfg.bootstrap_voters or cfg.peers.keys()),
+        )
+        # 首次初始化：引导角色（standby 不自举；primary 以 term=1 自举授权）。
+        # 重启时角色/任期/授权完全从磁盘恢复，引导参数不再生效。
+        if self.cluster.fresh:
+            if cfg.bootstrap_role == STANDBY:
+                self.cluster.become_standby()
+            else:
+                ttl = cfg.grant_ttl_ms if len(self.cluster.s.voters) > 1 else MAX_GRANT_TTL_MS
+                self.cluster.assume_leadership(1, ttl)
+        self.replica = ReplicaStore(os.path.join(self.state_dir, "replica.json"))
+        if self.cluster.fresh and cfg.bootstrap_role == STANDBY and cfg.replica_source:
+            self.replica.peer_url = cfg.replica_source.rstrip("/")
+            self.replica.status = SYNCING
+            self.replica.persist()
+
         self.meta_lock = threading.RLock()
         self._compact_active = False
         self.last_compact: dict[str, Any] = {}
@@ -114,13 +151,20 @@ class Kernel:
                               "committed checkpoint boundary is corrupt; refusing to start",
                               gen=gen, reason=str(e))
 
-                # 指针有效：幂等补删已承诺覆盖的段、清理非当前代目录
-                covered = set(pointer.get("covered_segs", []))
+                # 指针有效：幂等补做安装/压缩后承诺的段清理、清理非当前代目录。
+                # 主库压缩：covered_segs 是主库自己的段编号；备库安装快照：
+                # covered_segs 是本地被删前缀段（安装时即时维护），
+                # 来源段编号保存在 source_covered_segs 仅供追溯。
                 deleted_now: list[int] = []
-                for seg_id in sorted(covered):
-                    if seg_id in self.seglog.segments:
-                        self.seglog.delete_segment(seg_id)
-                        deleted_now.append(seg_id)
+                pending = pointer.get("pending_prefix")
+                if pending:
+                    deleted_now += self._finish_prefix_cleanup(pointer, pending)
+                elif not pointer.get("installed_by_replication"):
+                    covered = set(pointer.get("covered_segs", []))
+                    for seg_id in sorted(covered):
+                        if seg_id in self.seglog.segments:
+                            self.seglog.delete_segment(seg_id)
+                            deleted_now.append(seg_id)
                 pruned = self.checkpoints.remove_gens_before(gen)
                 for g in self.checkpoints.existing_gens():
                     if g != gen:
@@ -140,7 +184,87 @@ class Kernel:
                 # 链尾被回滚截断：以新链尖重写链头锚点后再核对
                 self._persist_head()
             self._reconcile_head()
+            recovery["replica"] = self._reconcile_replica()
             return recovery
+
+    def _finish_prefix_cleanup(self, pointer: dict, pending_seq: int) -> list[int]:
+        """指针已切换、前缀删除未完成时的幂等补做（快照安装崩溃恢复）。
+
+        与 _prune_prefix_locked 的提交后步骤完全一致；完成后清掉 pending 标记。
+        pending_seq 即快照边界 snapshot_seq（记录序号，1 起；全新备库本地
+        只有空活动段时，把它锚定到边界即可，不删任何段）。
+        """
+        before = set(self.seglog.segments)
+        tail_seg = self.seglog.truncate_prefix_in_segment(
+            pending_seq + 1, pointer["tail_anchor"])
+        deleted = sorted(before - set(self.seglog.segments))
+        if all(m.count == 0 for m in self.seglog.segments.values()):
+            # 无尾部（全新备库 / 前缀全部覆盖）：游标锚定到边界
+            self.seglog.reset_anchor(pending_seq, pointer["tail_anchor"])
+        elif tail_seg >= 0:
+            self._sync_tip(pointer["tail_anchor"])
+        pointer.pop("pending_prefix", None)
+        pointer["covered_segs"] = sorted(
+            set(pointer.get("covered_segs", [])) | set(deleted))
+        self.checkpoints.commit_pointer(pointer)
+        return deleted
+
+    def _reconcile_replica(self) -> dict:
+        """启动时依据本地已确认链对账复制进度（全量/增量中断后的恢复）。
+
+        - synced 锚点之后本地还有连续记录（上次崩溃在「记录已 fsync、
+          进度落盘」之前）：顺序摘要校验通过则把确认位置前滚；
+        - synced 处摘要与本地记录不符 -> 冲突，冻结，绝不静默覆盖；
+        - 已配置来源但状态为 idle：转 syncing 等待拉取。
+        """
+        rep = self.replica
+        if rep.peer_url is None:
+            return {"status": rep.status}
+        tip_seq, tip_digest = self.seglog.tip()
+        # 快照指针已原子切换、但 replica.json 更新前崩溃：以已安装边界补齐进度
+        pointer = self.checkpoints.current
+        if pointer is not None and pointer.get("installed_by_replication"):
+            bseq = int(pointer["seq"])
+            if rep.synced_seq < bseq:
+                rep.advance(bseq, pointer["tail_anchor"], status=SYNCING)
+                tip_seq, tip_digest = self.seglog.tip()
+        if rep.status == CONFLICT:
+            return {"status": CONFLICT, "note": "left in conflict; operator reset required"}
+        # 校验已确认锚点位置记录原样（若该序号仍在本地链上）
+        if rep.synced_seq > 0:
+            at = self._digest_at(rep.synced_seq)
+            if at is not None and at != rep.synced_digest:
+                rep.mark_error("replication_conflict",
+                               "local history diverges at confirmed position",
+                               seq=rep.synced_seq)
+                return {"status": CONFLICT, "seq": rep.synced_seq}
+        # 从已确认位置重放本地多余记录，全部衔接才前滚
+        if tip_seq > rep.synced_seq:
+            recs = self.seglog.read_records(rep.synced_seq + 1,
+                                            tip_seq - rep.synced_seq)
+            expect = rep.synced_digest
+            last_d = expect
+            last_seq = rep.synced_seq
+            ok = True
+            if len(recs) == tip_seq - rep.synced_seq:
+                for r in recs:
+                    if r["seq"] != last_seq + 1 or r["prev"] != expect:
+                        ok = False
+                        break
+                    expect, last_d = r["digest"], r["digest"]
+                    last_seq = r["seq"]
+            else:
+                ok = False  # 本地链在已确认位置之后有空洞
+            if ok:
+                rep.advance(last_seq, last_d, status=SYNCING)
+            else:
+                rep.mark_error("replication_conflict",
+                               "local tail does not extend confirmed position",
+                               seq=rep.synced_seq)
+                return {"status": CONFLICT, "seq": rep.synced_seq}
+        elif rep.status in (IDLE, CAUGHT_UP, SYNCING):
+            rep.set_status(SYNCING)
+        return {"status": rep.status, "synced_seq": rep.synced_seq}
 
     def _recover_batches(self) -> dict:
         """清算 committing 状态的批次：已登记的补记为整批已提交，否则整批回滚。"""
@@ -180,6 +304,13 @@ class Kernel:
 
     def _sync_tip(self, anchor: str) -> None:
         """根据指针锚点校准现存链；活动段游标由 scan 已建好。"""
+        # 快照安装后可能只有一个空活动段：游标直接锚定到边界
+        if self.seglog.tip()[0] == 0 and anchor != GENESIS:
+            pointer = self.checkpoints.current
+            base_seq = pointer["seq"] if pointer else 0
+            if pointer is not None:
+                self.seglog.anchor_empty_active(base_seq, anchor)
+                return
         vr = self.seglog.verify_chain_from(anchor)
         if not vr.ok:
             raise err(500, "tail_corrupt", "live tail chain does not match checkpoint anchor",
@@ -254,8 +385,26 @@ class Kernel:
     # 追加
     # =====================================================================
 
+    # =====================================================================
+    # 角色门控：只有持有「当前任期 + 未过期」授权的主接受写入
+    # =====================================================================
+
+    def _require_writable_primary(self) -> None:
+        if self.cluster.role != PRIMARY:
+            raise err(403, "not_primary",
+                      "this node is a standby; writes go to the primary",
+                      role=self.cluster.role)
+        if self.cluster.term <= 0:
+            raise err(403, "no_term", "node has no leadership term")
+        if not self.cluster.grant_valid():
+            raise err(403, "grant_expired",
+                      "leadership grant for this term has expired; "
+                      "a new election is required",
+                      term=self.cluster.term)
+
     def append(self, rec_type: str, payload: Any) -> dict:
         with self.meta_lock:
+            self._require_writable_primary()
             # 入链前校验业务负载，坏记录绝不进哈希链
             Reducer().apply(rec_type, payload)
             rec = self.seglog.append(rec_type, payload, now_ms())
@@ -284,6 +433,7 @@ class Kernel:
 
     def create_batch(self, idempotency_key: Optional[str], ttl_ms: Optional[int]) -> dict:
         with self.meta_lock:
+            self._require_writable_primary()
             if idempotency_key is not None:
                 if not isinstance(idempotency_key, str) or not (1 <= len(idempotency_key) <= 256):
                     raise err(400, "bad_request", "idempotency_key must be a string of length 1..256")
@@ -293,6 +443,7 @@ class Kernel:
 
     def batch_add_ops(self, batch_id: str, ops: Any) -> dict:
         with self.meta_lock:
+            self._require_writable_primary()
             b = self._require_batch(batch_id)
             st = b.effective_status(now_ms())
             if st == EXPIRED:
@@ -322,6 +473,7 @@ class Kernel:
         - 并发提交由 meta_lock 串行化，只有一个真正入链，其余拿到重放结果。
         """
         with self.meta_lock:
+            self._require_writable_primary()
             b = self._require_batch(batch_id)
             if b.status == COMMITTED:
                 # 同批次重复提交：返回首次结果，不重复入链
@@ -539,6 +691,10 @@ class Kernel:
     def compact(self, force: bool = False) -> dict:
         """执行一次压缩。force 只用于绕过「段数阈值」，绝不绕过租约。"""
         with self.meta_lock:
+            if self.cluster.role != PRIMARY:
+                raise err(403, "not_primary",
+                          "compaction is primary-only; boundaries arrive via replication")
+            self._require_writable_primary()
             if self._compact_active:
                 raise BusyError()
             try:
@@ -866,6 +1022,740 @@ class Kernel:
             os._exit(99)
 
     # =====================================================================
+    # 主备复制：来源导出（主）+ 拉取安装（备）
+    # =====================================================================
+
+    # ---------- 主实例：只读导出接口（RPC 由 server 层调用） ----------
+
+    def _require_export_primary(self, expected_term: int = 0) -> None:
+        """复制协议仅主实例提供；旧任期主（已被更高任期取代）显式拒绝。"""
+        if self.cluster.role != PRIMARY:
+            raise err(403, "not_primary", "not serving as primary")
+        if expected_term and expected_term != self.cluster.term:
+            raise err(409, "stale_term",
+                      "replication session term differs from current term",
+                      expected=expected_term, current=self.cluster.term)
+
+    def export_boundary(self) -> dict:
+        with self.meta_lock:
+            self._require_export_primary()
+            pointer = self.checkpoints.current
+            tip_seq, tip_digest = self.seglog.tip()
+            return {
+                "term": self.cluster.term,
+                "tip_seq": tip_seq,
+                "tip_digest": tip_digest,
+                "checkpoint": (
+                    None if pointer is None else
+                    {"gen": pointer["gen"], "seq": pointer["seq"],
+                     "tail_anchor": pointer["tail_anchor"],
+                     "state_digest": pointer["state_digest"],
+                     "snapshot_digest": pointer["snapshot_digest"],
+                     "manifest_digest": pointer["manifest_digest"]}),
+            }
+
+    def export_records(self, from_seq: int, limit: int, expected_term: int = 0) -> dict:
+        with self.meta_lock:
+            self._require_export_primary(expected_term)
+            pointer = self.checkpoints.current
+            readable_from = pointer["seq"] + 1 if pointer else 1
+            if from_seq < readable_from:
+                # 备库落后太多：明确要求它安装当前边界，不返回错误数据
+                raise err(410, "snapshot_required",
+                          "requested range already compacted at source; install snapshot",
+                          readable_from=readable_from,
+                          checkpoint_gen=pointer["gen"] if pointer else 0)
+            limit = max(1, min(limit, 5_000))
+            tip_seq, tip_digest = self.seglog.tip()
+            recs = self.seglog.read_records(from_seq, limit)
+            # 把自校验摘要带给备库（备库仍会独立重算，不信任线上字段）
+            for r in recs:
+                r["digest"] = record_digest(r)
+            return {
+                "term": self.cluster.term,
+                "from": from_seq,
+                "tip_seq": tip_seq,
+                "tip_digest": tip_digest,
+                "records": recs,
+                "next": recs[-1]["seq"] + 1 if recs else from_seq,
+            }
+
+    def export_snapshot(self, gen: int, expected_term: int = 0) -> dict:
+        with self.meta_lock:
+            self._require_export_primary(expected_term)
+            pointer = self.checkpoints.current
+            if pointer is None:
+                raise err(404, "no_checkpoint", "source has no checkpoint boundary")
+            if gen and gen != pointer["gen"]:
+                raise err(409, "gen_mismatch", "requested gen is not current",
+                          requested=gen, current=pointer["gen"])
+            snap_doc = read_json(os.path.join(
+                self.checkpoints.gen_dir(pointer["gen"]), SNAPSHOT))
+            man_doc = read_json(os.path.join(
+                self.checkpoints.gen_dir(pointer["gen"]), MANIFEST))
+            tip_seq, tip_digest = self.seglog.tip()
+            return {
+                "term": self.cluster.term,
+                "gen": pointer["gen"],
+                "pointer": pointer,
+                "snapshot": snap_doc,
+                "manifest": man_doc,
+                "tip_seq": tip_seq,
+                "tip_digest": tip_digest,
+            }
+
+    # ---------- 备实例：复制控制 ----------
+
+    def configure_replica(self, peer_url: str) -> dict:
+        with self.meta_lock:
+            if self.cluster.role != STANDBY:
+                raise err(409, "not_standby", "only a standby can follow a source",
+                          role=self.cluster.role)
+            if not isinstance(peer_url, str) or not (1 <= len(peer_url) <= 512) \
+                    or "://" not in peer_url:
+                raise err(400, "bad_request",
+                          "peer_url must be an absolute URL (http/https, "
+                          "or an injected test transport scheme)")
+            if self.replica.status == CONFLICT:
+                raise err(409, "replication_conflict",
+                          "replica is stopped at a conflict; reset before re-targeting")
+            self.replica.configure(peer_url.rstrip("/"))
+            # 已确认位置为 0 但本地链非空（典型：旧主交接后转为备）：
+            # 不能直接假定本地历史就是来源历史——先在下一个拉取周期用
+            # 来源边界做分叉判定（在边界之前要求摘要一致），一致才只拉增量。
+            return self.replication_view()
+
+    def stop_replica(self) -> dict:
+        with self.meta_lock:
+            if self.replica.status == CONFLICT:
+                raise err(409, "replication_conflict",
+                          "replica is stopped at a conflict; resolve it explicitly")
+            self.replica.stop()
+            return self.replication_view()
+
+    def reset_replica(self) -> dict:
+        """人工解除冲突：丢弃复制关系回到 idle（保留本地链供只读核查）。
+
+        冲突绝不自动恢复；只能由运维显式重置后重新指定来源。
+        """
+        with self.meta_lock:
+            self.replica.stop()
+            self.replica.status = IDLE
+            self.replica.last_error = None
+            self.replica.synced_seq = 0
+            self.replica.synced_digest = GENESIS
+            self.replica.source_boundary = None
+            self.replica.persist()
+            return self.replication_view()
+
+    def run_replication_cycle(self, transport: Optional[Callable] = None) -> dict:
+        """一个拉取周期：边界 ->（快照安装）-> 增量，全程持锁、逐记录校验。"""
+        from .replication import PATH_BOUNDARY, PATH_RECORDS, PATH_SNAPSHOT
+
+        transport = transport or self._http
+        with self.meta_lock:
+            if self.cluster.role != STANDBY:
+                return {"skipped": "not_standby"}
+            peer = self.replica.peer_url
+            if not peer:
+                return {"skipped": "no_peer"}
+            if self.replica.status == CONFLICT:
+                return {"skipped": "conflict"}
+            self.replica.mark_attempt()
+            try:
+                _st, bnd = transport("GET", peer + PATH_BOUNDARY)
+                term = int(bnd["term"])
+                if term < self.cluster.term:
+                    # 旧主（旧任期）提供的数据必须明确拒绝
+                    raise err(409, "stale_term",
+                              "source serves an older term; refuse its data",
+                              source_term=term, local_term=self.cluster.term)
+                if term > self.cluster.term:
+                    # 发现更高任期：前滚本地任期（备角色不变）
+                    self.cluster.bump_term(term)
+                cp = bnd.get("checkpoint")
+                self.replica.set_boundary({
+                    "term": term,
+                    "tip_seq": bnd["tip_seq"],
+                    "tip_digest": bnd["tip_digest"],
+                    "checkpoint_gen": cp["gen"] if cp else 0,
+                    "checkpoint_seq": cp["seq"] if cp else 0,
+                })
+
+                # 旧主转备/手工配置：已确认位置为 0 但本地链非空。
+                # 只有当来源承认本地历史（本地 tip 在来源历史上）时，才把
+                # 确认位置锚定到本地 tip，之后只拉增量；否则走快照安装/冲突。
+                if self.replica.synced_seq == 0:
+                    ltip_seq, ltip_digest = self.seglog.tip()
+                    if ltip_seq > 0 and self._source_acknowledges(
+                            transport, peer, term, ltip_seq, ltip_digest, cp):
+                        self.replica.advance(ltip_seq, ltip_digest, status=SYNCING)
+
+                rep_synced = self.replica.synced_seq
+                local_gen = self.checkpoints.current["gen"] if self.checkpoints.current else 0
+                # 已装同一代边界 -> 直接增量；否则只要已确认位置没有越过来源
+                # 边界就安装完整边界（全新备库 local_gen=0 必然安装）
+                if cp is None or local_gen == cp["gen"]:
+                    need_snapshot = False
+                else:
+                    need_snapshot = rep_synced == 0 or rep_synced <= cp["seq"]
+                installed = False
+                if need_snapshot:
+                    _st, snap = transport(
+                        "GET", peer + PATH_SNAPSHOT, qs={"gen": cp["gen"], "term": term})
+                    self.install_snapshot(snap, replace_local=(rep_synced <= cp["seq"]))
+                    installed = True
+
+                start = self.replica.synced_seq + 1
+                try:
+                    _st, page = transport(
+                        "GET", peer + PATH_RECORDS,
+                        qs={"from": start, "limit": self.cfg.replication_batch,
+                            "term": term})
+                except Error as e:
+                    if e.code == "snapshot_required":
+                        # 边界在拉取期间前进：下一轮安装新边界（已应用的不回退）
+                        self.replica.mark_error(e.code, e.message, **e.details)
+                        return {"error": e.code, "message": e.message}
+                    raise
+                if int(page.get("term", term)) < self.cluster.term:
+                    raise err(409, "stale_term", "records page came from an older term")
+                applied = self.apply_records(page)
+                new_status = (CAUGHT_UP if self.replica.synced_seq >= bnd["tip_seq"]
+                              else SYNCING)
+                self.replica.set_status(new_status)
+                return {"installed_snapshot": installed,
+                        "applied": applied,
+                        "synced_seq": self.replica.synced_seq,
+                        "status": new_status}
+            except Error as e:
+                self.replica.mark_error(e.code, e.message, **e.details)
+                return {"error": e.code, "message": e.message}
+            except Exception as e:  # 传输错误等：记录最近错误，下轮重试
+                code = getattr(e, "code", "transport_error")
+                self.replica.mark_error(code, str(e)[:300])
+                return {"error": code}
+
+    def _source_acknowledges(self, transport, peer: str, term: int,
+                             seq: int, digest: str, source_cp: Optional[dict]) -> bool:
+        """来源历史是否包含本地 tip（旧主转备时的同一性判定）。
+
+        seq 在来源现存尾部 -> 拉该单条记录比摘要；
+        seq 恰是来源 checkpoint 点 -> 比 tail_anchor；
+        seq 更早（已压缩）-> 拉快照凭证逐条比。
+        任何不一致/取不到都返回 False（调用方转入快照安装/分叉处理）。
+        """
+        from .replication import PATH_RECORDS, PATH_SNAPSHOT
+        try:
+            if source_cp is not None and seq <= int(source_cp["seq"]):
+                if seq == int(source_cp["seq"]) and \
+                        digest == source_cp["tail_anchor"]:
+                    return True
+                _st, snap = transport(
+                    "GET", peer + PATH_SNAPSHOT,
+                    qs={"gen": source_cp["gen"], "term": term})
+                cred = self._manifest_digest_at(snap["manifest"], seq)
+                return cred == digest
+            _st, page = transport(
+                "GET", peer + PATH_RECORDS,
+                qs={"from": seq, "limit": 1, "term": term})
+            recs = page.get("records", [])
+            return bool(recs) and recs[0]["seq"] == seq \
+                and record_digest(recs[0]) == digest
+        except Error:
+            return False
+        except Exception:
+            return False
+
+    def apply_records(self, page: dict) -> int:
+        """顺序、去重、摘要链校验地应用一页来源记录。
+
+        - seq <= synced 的重复段：逐条与本地摘要比对，相同跳过（不重复应用），
+          不同即冲突；
+        - seq > synced：必须 seq == synced+1 且 prev 衔接、重算摘要一致，
+          否则停在 replication_conflict，绝不静默覆盖。
+        """
+        recs = page.get("records", [])
+        if not recs:
+            if self.replica.synced_seq < int(page.get("tip_seq", self.replica.synced_seq)):
+                # 来源有更新但拿不到下一条（已压缩）：下轮装快照，不算冲突
+                return 0
+            return 0
+        applied = 0
+        skipped = 0
+        new_records: list[dict] = []
+        expect_anchor = self.replica.synced_digest
+        expect_seq = self.replica.synced_seq + 1
+        for r in recs:
+            seq = int(r["seq"])
+            rd = record_digest(r)
+            if seq < self.replica.synced_seq or (
+                    seq == self.replica.synced_seq and self.replica.synced_seq > 0):
+                # 重复段（严格早于/等于已确认位置；synced_seq=0 是空锚点不是记录）：
+                # 必须与已确认历史逐条一致才允许跳过
+                local = self._digest_at(seq)
+                if local is not None and local != rd:
+                    self._raise_conflict(seq, local, rd, "duplicate segment diverges")
+                if local is None and seq > 0:
+                    # 已确认位置之前却没有记录（压缩空洞）：以边界凭证为准，跳过
+                    pass
+                skipped += 1
+                continue
+            if seq != expect_seq:
+                self._raise_conflict(
+                    seq, None, rd,
+                    "source seq is not contiguous with confirmed position")
+            if r.get("prev") != expect_anchor:
+                self._raise_conflict(seq, expect_anchor, r.get("prev"),
+                                     "prev anchor diverges")
+            if rd != r.get("digest"):
+                self._raise_conflict(seq, r.get("digest"), rd,
+                                     "record digest field does not verify")
+            new_records.append(r)
+            expect_anchor = rd
+            expect_seq = seq + 1
+        try:
+            # 整批导入（内部逐条 fsync，任一不符即回滚未写部分）
+            self.seglog.import_records(new_records)
+        except Error:
+            # 磁盘层发现断链：截断可能已写的后缀并进入冲突
+            tip_before = self.replica.synced_seq
+            if self.seglog.tip()[0] > tip_before:
+                self.seglog.truncate_tail(tip_before)
+                pointer = self.checkpoints.current
+                self._sync_tip(pointer["tail_anchor"] if pointer else GENESIS)
+                self._persist_head()
+            self.replica.set_status(CONFLICT)
+            raise
+        if new_records:
+            last = new_records[-1]
+            self._persist_head()
+            # 与主库一致的滚动阈值，避免备库活动段无限增长
+            if self.seglog.segments[self.seglog.active_id].size >= self.cfg.segment_bytes:
+                self.seglog.rotate()
+            # 每条记录都已 fsync；确认位置落盘后才视为「已同步」，
+            # 崩溃重启从该位置继续，重复数据不会重复应用。
+            self.replica.advance(int(last["seq"]), record_digest(last))
+            applied = len(new_records)
+        return applied
+
+    def _raise_conflict(self, seq: int, expected: Any, got: Any, reason: str) -> None:
+        self.replica.mark_error(
+            "replication_conflict",
+            f"local history diverges from source at synced position: {reason}",
+            seq=seq, expected=str(expected)[:32], got=str(got)[:32])
+        self.replica.set_status(CONFLICT)
+        raise err(409, "replication_conflict", reason, seq=seq)
+
+    # ---------- 备实例：全量边界（快照）原子安装 ----------
+
+    def install_snapshot(self, snap: dict, replace_local: bool = False) -> None:
+        """把来源当前完整边界原子安装到本地。
+
+        replace_local=True 时，已确认位置落后于边界（备库落后太多或
+        bootstrap）：安装后本地只保留边界之后的尾部，边界之前的本地链
+        全部丢弃；这不是静默覆盖——决策由复制状态机依据「已确认位置」
+        显式做出，且边界文档本身逐条自校验。
+
+        原子性（与压缩同一套提交协议）：
+          1. 全部内容写入 gen-N.tmp.*（与现有 current 无关，旧状态照常服务）；
+          2. 独立复核（envelope 自校验、互链、状态摘要、与本地已确认历史的
+             分叉检查）；
+          3. audit 留痕 + current.json 原子替换（唯一提交点）；
+          4. 删除快照覆盖的本地前缀；崩溃则启动时凭 pending_prefix 幂等补做。
+        提交前任一阶段崩溃：重启丢弃 tmp，本地仍是安装前的完整状态。
+        """
+        try:
+            pointer = snap["pointer"]
+            snap_body = open_doc(snap["snapshot"], "snapshot")
+            man_body = open_doc(snap["manifest"], "manifest")
+            gen = int(pointer["gen"])
+        except (KeyError, ValueError, TypeError) as e:
+            raise err(409, "bad_snapshot", f"snapshot documents invalid: {e}")
+
+        cur = self.checkpoints.current
+        # 同一代边界幂等：已安装则直接对齐进度（增量阶段会继续）
+        if cur is not None and cur["gen"] == gen \
+                and cur["manifest_digest"] == pointer["manifest_digest"]:
+            if self.replica.synced_seq < pointer["seq"]:
+                self.replica.reset_to_installed(
+                    pointer["seq"], pointer["tail_anchor"],
+                    self.replica.source_boundary)
+            return
+        if cur is not None and gen <= cur["gen"]:
+            raise err(409, "bad_snapshot",
+                      "snapshot generation is older than installed boundary",
+                      gen=gen, installed=cur["gen"])
+
+        # ---- 分叉检查：已确认历史必须是来源边界的真前缀 ----
+        seq = int(pointer["seq"])
+        if self.replica.synced_seq > 0 and self.replica.synced_seq <= seq:
+            # 已确认位置落在来源边界之内：该位置摘要必须与来源凭证一致，
+            # 否则就是在已同步位置发生分叉——停在冲突，绝不静默覆盖。
+            cred = self._manifest_digest_at(man_body, self.replica.synced_seq)
+            local_at = self._digest_at(self.replica.synced_seq)
+            if cred is None:
+                raise err(409, "bad_snapshot",
+                          "source manifest does not attest the confirmed position",
+                          seq=self.replica.synced_seq)
+            if local_at is not None and cred != local_at:
+                self._raise_conflict(self.replica.synced_seq, local_at, cred,
+                                     "snapshot attestation diverges at confirmed position")
+
+        # ---- 文档自校验与互链 ----
+        self._verify_snapshot_bundle(pointer, snap_body, man_body, gen)
+        self._crash_hook("snapshot_after_verify")
+
+        # ---- 完整写入 staging（半成品永不进入可见目录） ----
+        cur_gen = cur["gen"] if cur else 0
+        install_gen = max(gen, cur_gen + 1)
+        self.checkpoints.write_generation(install_gen, snap_body, man_body)
+        self._crash_hook("snapshot_after_write")
+
+        # ---- 唯一提交点：审计 + 指针原子替换 ----
+        new_pointer = dict(pointer)
+        new_pointer["gen"] = install_gen
+        new_pointer["installed_by_replication"] = True
+        new_pointer["source_gen"] = gen
+        # 来源段编号仅供追溯，不能在本地按它删段：本地段编号独立
+        new_pointer["source_covered_segs"] = list(pointer.get("covered_segs", []))
+        new_pointer["covered_segs"] = []
+        # 提交后待清理的本地前缀；崩溃重启凭它幂等补做
+        new_pointer["pending_prefix"] = seq
+        self.checkpoints.append_audit({
+            "gen": install_gen,
+            "kind": "snapshot_installed",
+            "source_gen": gen,
+            "seq": seq,
+            "tail_anchor": pointer["tail_anchor"],
+            "manifest_digest": pointer["manifest_digest"],
+            "snapshot_digest": pointer["snapshot_digest"],
+            "state_digest": pointer["state_digest"],
+        })
+        self.checkpoints.commit_pointer(new_pointer)
+        self._crash_hook("snapshot_after_switch")
+
+        # ---- 提交后：删除被边界覆盖的本地旧前缀（崩溃则启动幂等补做） ----
+        if replace_local:
+            # 已确认位置在边界之内：安装后本地链只保留边界之后的内容。
+            # 现存记录全部来自旧历史，不能与新边界混用，整体锚定到边界，
+            # 之后的增量从 snapshot_seq+1 重新拉取（绝不会新旧各一半）。
+            self.seglog.reset_anchor(seq, new_pointer["tail_anchor"])
+            new_pointer.pop("pending_prefix", None)
+            new_pointer["covered_segs"] = []
+            self.checkpoints.commit_pointer(new_pointer)
+        else:
+            self._prune_prefix_locked(new_pointer, seq)
+        # 校准链游标与链头锚点
+        self._sync_tip(new_pointer["tail_anchor"])
+        self._persist_head()
+        self.replica.reset_to_installed(
+            seq, new_pointer["tail_anchor"], self.replica.source_boundary)
+
+    @staticmethod
+    def _manifest_digest_at(man_body: dict, seq: int) -> Optional[str]:
+        for att in man_body.get("segments", []):
+            digests = att.get("record_digests", [])
+            # 凭证内 seq 连续，first_seq 给出起点
+            first = int(att.get("first_seq", 0))
+            idx = seq - first
+            if 0 <= idx < len(digests):
+                return digests[idx]
+        return None
+
+    def _verify_snapshot_bundle(self, pointer: dict, sb: dict, mb: dict, gen: int) -> None:
+        if pointer["snapshot_digest"] != digest_json(sb):
+            raise err(409, "bad_snapshot", "pointer/snapshot digest mismatch")
+        if pointer["manifest_digest"] != digest_json(mb):
+            raise err(409, "bad_snapshot", "pointer/manifest digest mismatch")
+        if pointer["state_digest"] != digest_json(sb["state"]):
+            raise err(409, "bad_snapshot", "pointer/state digest mismatch")
+        if mb["snapshot_digest"] != digest_json(sb):
+            raise err(409, "bad_snapshot", "manifest->snapshot link mismatch")
+        if sb["tail_anchor"] != pointer["tail_anchor"] != mb["tail_anchor"]:
+            raise err(409, "bad_snapshot", "tail anchor mismatch across documents")
+        if mb["state_digest"] != pointer["state_digest"]:
+            raise err(409, "bad_snapshot", "manifest state_digest mismatch")
+        for att in mb.get("segments", []):
+            if digest_json(att["record_digests"]) != att["records_root"]:
+                raise err(409, "bad_snapshot", "attestation records_root mismatch",
+                          seg=att.get("seg"))
+
+    def _prune_prefix_locked(self, pointer: dict, seq: int) -> None:
+        """快照边界提交后，删除本地链中 <= seq 的记录（整段删段、跨界段重写）。"""
+        before = set(self.seglog.segments)
+        tail_seg = self.seglog.truncate_prefix_in_segment(
+            seq + 1, pointer["tail_anchor"])
+        deleted = sorted(before - set(self.seglog.segments))
+        if all(m.count == 0 for m in self.seglog.segments.values()):
+            self.seglog.reset_anchor(seq, pointer["tail_anchor"])
+        pointer.pop("pending_prefix", None)
+        pointer["covered_segs"] = sorted(set(deleted))
+        self.checkpoints.commit_pointer(pointer)
+
+    # =====================================================================
+    # 选举（任期+多数派+投票互斥）与主授权
+    # =====================================================================
+
+    def campaign(self, term: Optional[int] = None, grant_ttl_ms: Optional[int] = None,
+                 voter_urls: Optional[list[str]] = None,
+                 transport: Optional[Callable] = None,
+                 min_catch_up_seq: Optional[int] = None) -> dict:
+        """备用实例发起竞选并尝试提升。
+
+        协议（每个任期最多一个胜者）：
+          1. 必须是备、且不在复制冲突态；
+          2. 必须已追到来源：synced_seq >= 来源 tip（可被 min_catch_up_seq 覆盖，
+             用于要求达到授权指定序号）；
+          3. term 必须高于本地当前任期；先给自己投票并落盘（投票持久化，
+             重启不重置），再向其他成员拉票；
+          4. 多数派同意（含自己）才就任并获得带 TTL 的授权，否则 409。
+        """
+        from .replication import PATH_REQUEST_VOTE
+
+        transport = transport or self._http
+        with self.meta_lock:
+            if self.cluster.role != STANDBY:
+                raise err(409, "not_standby", "only a standby can campaign",
+                          role=self.cluster.role)
+            if self.replica.status == CONFLICT:
+                raise err(409, "replication_conflict",
+                          "cannot promote from a conflict state")
+            # 必须先追平来源：显式 required_seq 优先；否则以最近一次来源边界
+            # 的 tip 为门槛；从未联系过来源（无边界）的备实例禁止提升。
+            require_seq = min_catch_up_seq
+            if require_seq is None:
+                if self.replica.source_boundary is None:
+                    raise err(409, "never_synced",
+                              "standby has never contacted its source; cannot promote")
+                require_seq = int(self.replica.source_boundary["tip_seq"])
+            if self.replica.synced_seq < require_seq:
+                raise err(409, "behind_requirement",
+                          "standby has not caught up to the required sequence",
+                          synced_seq=self.replica.synced_seq,
+                          required_seq=require_seq)
+            cur_term = self.cluster.term
+            if term is None:
+                new_term = cur_term + 1
+            else:
+                new_term = int(term)
+                # 同任期重试（如 RPC 后不知道结果）：必须仍持有本任期自选票
+                if new_term == cur_term:
+                    if self.cluster.s.voted_for != self.cluster.node_id:
+                        raise err(409, "already_voted",
+                                  "already voted for another candidate in this term",
+                                  term=cur_term)
+                elif new_term < cur_term:
+                    raise err(409, "stale_term",
+                              "campaign term must not be older than current term",
+                              current_term=cur_term, requested_term=new_term)
+            ttl = self._clamp_grant_ttl(grant_ttl_ms)
+            peers = self._voter_peers(voter_urls)
+            last_log_seq, last_log_digest = self.seglog.tip()
+            body = {
+                "term": new_term,
+                "candidate": self.cluster.node_id,
+                "last_log_seq": last_log_seq,
+                "last_log_digest": last_log_digest,
+            }
+            need = len(peers) // 2 + 1
+            peer_urls = [u for nid, u in peers if nid != self.cluster.node_id]
+
+        # ---- 阶段 1（锁外 RPC）：先确认能拿到多数派，本节点状态暂不改变 ----
+        votes = 0
+        refusals: list[dict] = []
+        for url in peer_urls:
+            try:
+                _st, resp = transport("POST", url.rstrip("/") + PATH_REQUEST_VOTE, body)
+                if resp.get("vote_granted"):
+                    votes += 1
+                else:
+                    refusals.append({"peer": url, "reason": resp.get("reason", "denied"),
+                                     "term": resp.get("term")})
+                    if int(resp.get("term", 0)) > new_term:
+                        with self.meta_lock:
+                            self.cluster.bump_term(int(resp["term"]))
+                        raise err(409, "stale_term", "a newer term was discovered",
+                                  term=resp["term"])
+            except Error:
+                raise
+            except Exception as e:
+                refusals.append({"peer": url, "reason": getattr(e, "code", "unreachable")})
+
+        with self.meta_lock:
+            if votes + 1 < need:
+                # 竞选失败：不落自选票、不推进任期，调用方可修正后重试
+                raise err(409, "election_lost",
+                          "did not reach a majority; only one candidate can win a term",
+                          term=new_term, votes=votes, needed=need - 1,
+                          refusals=refusals)
+            # ---- 阶段 2：拿到多数派承诺后，再原子落自选票/就任 ----
+            # 期间本地任期可能被后台线程前滚；那时承诺作废，必须重新竞选。
+            if self.cluster.term > new_term:
+                raise err(409, "stale_term",
+                          "term advanced while campaigning; aborting promotion")
+            if self.cluster.term == new_term and \
+                    self.cluster.s.voted_for not in (None, self.cluster.node_id):
+                raise err(409, "already_voted",
+                          "voted for another candidate in this term")
+            self.cluster.cast_vote(new_term, self.cluster.node_id)
+            self.cluster.assume_leadership(new_term, ttl)
+            # 提升成功：停止跟随来源（后台复制线程检测到角色后自动退出）
+            self.replica.peer_url = None
+            if self.replica.status not in (CONFLICT,):
+                self.replica.set_status(CAUGHT_UP)
+            self.checkpoints.append_audit({
+                "kind": "promoted", "term": new_term,
+                "last_log_seq": last_log_seq, "grant_ttl_ms": ttl,
+                "votes": votes + 1, "needed": need,
+            })
+            return {
+                "term": new_term, "role": PRIMARY,
+                "votes": votes + 1, "needed": need,
+                "grant_expires_at": self.cluster.s.grant_expires_at,
+                "last_log_seq": last_log_seq,
+            }
+
+    def _voter_peers(self, voter_urls: Optional[list[str]]) -> list[tuple[str, str]]:
+        """返回竞选涉及的 (node_id, base_url) 列表（含自己）。
+
+        显式传入 voter_urls 时（运维指定选举集合），URL 即身份；
+        否则使用配置的 peers（node_id -> base_url）。
+        """
+        if voter_urls:
+            result: list[tuple[str, str]] = []
+            own_url = self.cfg.peers.get(self.cluster.node_id)
+            for u in voter_urls:
+                u = u.rstrip("/")
+                nid = next((n for n, x in self.cfg.peers.items()
+                            if x.rstrip("/") == u), u)
+                if not any(url == u for _, url in result):
+                    result.append((nid, u))
+            if not any(n == self.cluster.node_id for n, _ in result):
+                result.insert(0, (self.cluster.node_id,
+                                  own_url or f"local://{self.cluster.node_id}"))
+            return result
+        result = [(self.cluster.node_id,
+                   self.cfg.peers.get(self.cluster.node_id,
+                                     f"local://{self.cluster.node_id}"))]
+        for nid, url in self.cfg.peers.items():
+            if nid != self.cluster.node_id:
+                result.append((nid, url.rstrip("/")))
+        return result
+
+    def _clamp_grant_ttl(self, ttl_ms: Optional[int]) -> int:
+        ttl = self.cfg.grant_ttl_ms if ttl_ms is None else int(ttl_ms)
+        if not (1_000 <= ttl <= MAX_GRANT_TTL_MS):
+            raise err(400, "bad_ttl", f"grant ttl_ms must be in [1000,{MAX_GRANT_TTL_MS}]")
+        return ttl
+
+    def handle_request_vote(self, req: dict) -> dict:
+        """RPC：候选者请求选票。任期规则与「每任期一票」在此强制执行。"""
+        with self.meta_lock:
+            try:
+                term = int(req["term"])
+                candidate = str(req["candidate"])
+                last_seq = int(req.get("last_log_seq", 0))
+            except (KeyError, TypeError, ValueError):
+                raise err(400, "bad_request", "request_vote requires term, candidate")
+            # 旧任期：明确拒绝（旧主旧任期复活的第一道闸）
+            if term < self.cluster.term:
+                return {"term": self.cluster.term, "vote_granted": False,
+                        "reason": "stale_term"}
+            # 同任期且当前主授权仍有效：不让位（优雅切换需先 stepdown）
+            ok, reason = self.cluster.can_vote(term, candidate)
+            if not ok:
+                return {"term": self.cluster.term, "vote_granted": False, "reason": reason}
+            # 候选日志必须至少与本节点一样新（按 tip seq；等长再比摘要）
+            tip_seq, tip_digest = self.seglog.tip()
+            if last_seq < tip_seq:
+                return {"term": self.cluster.term, "vote_granted": False,
+                        "reason": "candidate_behind",
+                        "local_tip": tip_seq, "candidate_tip": last_seq}
+            if last_seq == tip_seq and req.get("last_log_digest") not in (None, tip_digest):
+                return {"term": self.cluster.term, "vote_granted": False,
+                        "reason": "log_divergence"}
+            self.cluster.cast_vote(term, candidate)
+            return {"term": term, "vote_granted": True, "reason": "ok"}
+
+    def handle_lease_ack(self, term: int) -> dict:
+        """RPC：主的任期心跳。见到更高有效任期立即让位（旧主不再提供服务）。"""
+        with self.meta_lock:
+            if term < self.cluster.term:
+                return {"term": self.cluster.term, "ack": False, "reason": "stale_term"}
+            if term > self.cluster.term:
+                self.cluster.bump_term(term)
+            return {"term": self.cluster.term, "ack": True}
+
+    def lease_refresh_once(self, ttl_ms: int, transport: Optional[Callable] = None) -> Optional[dict]:
+        """主授权续租一轮：多数派成员确认本任期才续期；否则任由授权过期。"""
+        from .replication import PATH_LEASE
+
+        transport = transport or self._http
+        with self.meta_lock:
+            if self.cluster.role != PRIMARY:
+                return None
+            term = self.cluster.term
+            peers = [u.rstrip("/") for nid, u in self.cfg.peers.items()
+                     if nid != self.cluster.node_id]
+            # 单节点（无对等成员）：自足多数派，直接续期
+            self_sufficient = not peers
+        acks = 1
+        for url in peers:
+            try:
+                _st, resp = transport("POST", url + PATH_LEASE, qs={"term": term})
+                if resp.get("ack"):
+                    acks += 1
+                elif int(resp.get("term", term)) > term:
+                    with self.meta_lock:
+                        self.cluster.bump_term(int(resp["term"]))
+                    return {"renewed": False, "reason": "stale_term"}
+            except Exception:
+                pass
+        with self.meta_lock:
+            if self.cluster.role != PRIMARY or self.cluster.term != term:
+                return {"renewed": False, "reason": "term_changed"}
+            total = len(self.cfg.peers) or 1
+            need = total // 2 + 1
+            if acks < need:
+                # 联系不到多数派：不续期；TTL 过后写入被 grant 门控拒绝
+                return {"renewed": False, "acks": acks, "needed": need}
+            if self_sufficient:
+                # 单节点：保持长效授权（无对端可仲裁，等同固定主）
+                self.cluster.renew_grant(MAX_GRANT_TTL_MS)
+            else:
+                self.cluster.renew_grant(ttl_ms)
+            return {"renewed": True, "acks": acks, "needed": need,
+                    "grant_expires_at": self.cluster.s.grant_expires_at}
+
+    def renew_grant(self, ttl_ms: Optional[int] = None) -> dict:
+        """人工续租：仍然要求授权当前有效；过期不能续，必须重新竞选。"""
+        with self.meta_lock:
+            if self.cluster.role != PRIMARY:
+                raise err(403, "not_primary", "only a primary holds a grant")
+            ttl = self._clamp_grant_ttl(ttl_ms)
+            try:
+                return self.cluster.renew_grant(ttl)
+            except TimeoutError:
+                raise err(403, "grant_expired",
+                          "grant expired; renew is impossible, run a new election")
+
+    def stepdown(self) -> dict:
+        """主动交接：当前主立即放弃授权、降为备。"""
+        with self.meta_lock:
+            if self.cluster.role != PRIMARY:
+                raise err(409, "not_primary", "not a primary")
+            term = self.cluster.term
+            self.cluster.invalidate_grant()
+            self.checkpoints.append_audit({"kind": "stepdown", "term": term})
+            return {"role": STANDBY, "term": term}
+
+    def _http(self, method: str, url: str, body: Any = None, qs: Any = None):
+        from .replication import http_transport
+
+        return http_transport(method, url, body, qs)
+
+    # =====================================================================
     # 读取 / 状态 / 状态总览
     # =====================================================================
 
@@ -924,6 +1814,35 @@ class Kernel:
                     if pointer else None),
             }
 
+    def replication_view(self) -> dict:
+        with self.meta_lock:
+            v = self.cluster.view()
+            rep = self.replica.view()
+            # 综合状态机：可写主 / 授权失效 / 同步中 / 已追平 / 冲突
+            if v["role"] == PRIMARY:
+                if v["grant_valid"]:
+                    phase = "writable_primary"
+                else:
+                    phase = "grant_invalid"
+            else:
+                if rep["role_status"] == CONFLICT:
+                    phase = "conflict"
+                elif rep["role_status"] == CAUGHT_UP:
+                    phase = "caught_up"
+                elif rep["peer_url"]:
+                    phase = "syncing"
+                else:
+                    phase = IDLE
+            tip_seq, tip_digest = self.seglog.tip()
+            return {
+                "phase": phase,
+                "cluster": v,
+                "replication": rep,
+                "tip_seq": tip_seq,
+                "tip_digest": tip_digest,
+                "caught_up": rep["role_status"] == CAUGHT_UP,
+            }
+
     def status(self) -> dict:
         with self.meta_lock:
             tip, tip_digest = self.seglog.tip()
@@ -946,5 +1865,7 @@ class Kernel:
                 "checkpoint": self.head_info()["checkpoint"],
                 "last_compaction": self.last_compact,
                 "compaction_running": self._compact_active,
+                "cluster": self.cluster.view(now),
+                "replication": self.replica.view(),
                 "data_dir": self.cfg.data_dir,
             }
