@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import os
+import threading
 
 import pytest
 
@@ -401,6 +402,82 @@ class TestElectionAndGrant:
         resp = s.handle_request_vote(
             {"term": 2, "candidate": "P", "last_log_seq": 4})
         assert resp["vote_granted"] is False
+
+    def test_concurrent_same_term_campaign_exactly_one_wins(self, tmp_path):
+        # 两个已追平的备用实例并发竞选同一任期：恰好一个成功，
+        # 另一个收到明确拒绝；不允许两个都失败，也不允许两个都成为主。
+        p = make_kernel(tmp_path, "p", node_id="P",
+                        peers={"P": "local://P", "S": "local://S",
+                               "T": "local://T"}, grant_ttl=300_000)
+        s = make_kernel(tmp_path, "s", role="standby", node_id="S",
+                        peers={"P": "local://P", "S": "local://S",
+                               "T": "local://T"},
+                        source="local://P", grant_ttl=300_000)
+        third = make_kernel(tmp_path, "t", role="standby", node_id="T",
+                            peers={"P": "local://P", "S": "local://S",
+                                   "T": "local://T"},
+                            source="local://P", grant_ttl=300_000)
+        t3 = direct_transport({"local://P": p, "local://S": s,
+                               "local://T": third})
+        seed(p, 4)
+        s.run_replication_cycle(t3)
+        third.run_replication_cycle(t3)
+        p.stepdown()
+
+        voters = ["local://P", "local://S", "local://T"]
+        # 让两个候选的首个拉票 RPC 同步后再放行，强制两边在处理任何
+        # 选票前都已完成（拉票前必须先落盘的）自选票。
+        barrier = threading.Barrier(2)
+        gate_lock = threading.Lock()
+        arrived: set[int] = set()
+
+        def synced_transport(method, url, body=None, qs=None):
+            if method == "POST" and url.endswith("/cluster/request_vote"):
+                tid = id(threading.current_thread())
+                with gate_lock:
+                    first = tid not in arrived
+                    arrived.add(tid)
+                if first:
+                    barrier.wait(timeout=5)
+            return t3(method, url, body, qs)
+
+        outcomes: dict[str, tuple] = {}
+
+        def run_campaign(who, kernel):
+            try:
+                outcomes[who] = ("won", kernel.campaign(
+                    term=2, voter_urls=voters, transport=synced_transport))
+            except Error as e:
+                outcomes[who] = ("lost", e)
+
+        threads = [threading.Thread(target=run_campaign, args=("S", s)),
+                   threading.Thread(target=run_campaign, args=("T", third))]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(10)
+            assert not th.is_alive(), "campaign thread hung"
+
+        winners = [n for n, r in outcomes.items() if r[0] == "won"]
+        losers = [n for n, r in outcomes.items() if r[0] == "lost"]
+        assert len(winners) == 1 and len(losers) == 1, outcomes
+        win_res = outcomes[winners[0]][1]
+        assert win_res["term"] == 2 and win_res["votes"] == 2
+        wk = s if winners[0] == "S" else third
+        lk = third if winners[0] == "S" else s
+        assert wk.cluster.role == "primary" and wk.cluster.term == 2
+        assert wk.cluster.grant_valid()
+        # 败者：明确的多数派失败，拒绝理由包含对手自选票的 already_voted
+        loss = outcomes[losers[0]][1]
+        assert loss.status == 409 and loss.code == "election_lost"
+        reasons = {r["reason"] for r in loss.details["refusals"]}
+        assert "already_voted" in reasons
+        # 败者仍是备；本任期票已投出并持久化（须更高任期才能再竞选）
+        assert lk.cluster.role == "standby"
+        assert lk.cluster.term == 2 and lk.cluster.s.voted_for == losers[0]
+        # 集群中恰好一个主
+        assert [n for n, k in (("P", p), ("S", s), ("T", third))
+                if k.cluster.role == "primary"] == [winners[0]]
 
     def test_old_leader_old_term_rejected(self, tmp_path):
         p, s, t = pair(tmp_path)

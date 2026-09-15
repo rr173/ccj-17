@@ -1503,13 +1503,16 @@ class Kernel:
                  min_catch_up_seq: Optional[int] = None) -> dict:
         """备用实例发起竞选并尝试提升。
 
-        协议（每个任期最多一个胜者）：
+        协议（每个任期恰好/最多一个胜者）：
           1. 必须是备、且不在复制冲突态；
           2. 必须已追到来源：synced_seq >= 来源 tip（可被 min_catch_up_seq 覆盖，
              用于要求达到授权指定序号）；
-          3. term 必须高于本地当前任期；先给自己投票并落盘（投票持久化，
-             重启不重置），再向其他成员拉票；
-          4. 多数派同意（含自己）才就任并获得带 TTL 的授权，否则 409。
+          3. term 必须不低于本地当前任期；进入该任期并把自选票**先原子落盘**
+             （投票持久化，重启不重置），然后才向其他成员拉票——
+             这样两个候选并发竞选同一任期时会互相拿到 already_voted，
+             决胜票只可能投给其中一个，恰好一个凑齐多数派；
+          4. 多数派同意（含自己）才就任并获得带 TTL 的授权，否则 409
+             election_lost（败者本任期票已投出，须以更高任期重试）。
         """
         from .replication import PATH_REQUEST_VOTE
 
@@ -1539,18 +1542,25 @@ class Kernel:
                 new_term = cur_term + 1
             else:
                 new_term = int(term)
-                # 同任期重试（如 RPC 后不知道结果）：必须仍持有本任期自选票
-                if new_term == cur_term:
-                    if self.cluster.s.voted_for != self.cluster.node_id:
-                        raise err(409, "already_voted",
-                                  "already voted for another candidate in this term",
-                                  term=cur_term)
-                elif new_term < cur_term:
+                if new_term < cur_term:
                     raise err(409, "stale_term",
                               "campaign term must not be older than current term",
                               current_term=cur_term, requested_term=new_term)
+                # 同任期重试（如 RPC 后不知道结果）：只有仍持有本任期自选票、
+                # 或尚未投过票时才允许；已投给别的候选必须明确拒绝。
+                if new_term == cur_term and \
+                        self.cluster.s.voted_for not in (None, self.cluster.node_id):
+                    raise err(409, "already_voted",
+                              "already voted for another candidate in this term",
+                              term=cur_term)
             ttl = self._clamp_grant_ttl(grant_ttl_ms)
             peers = self._voter_peers(voter_urls)
+            # ---- 关键互斥点：拉票前先持久化进入任期并投自己 ----
+            # 自选票落盘后，本节点对同任期任何其他候选一律 already_voted；
+            # 并发的两个候选因此不可能互相投赞成票，决胜票只能给其中一个，
+            # 可达的奇数选举集合中恰好一个成功，且绝不可能双双成为主。
+            self.cluster.cast_vote(new_term, self.cluster.node_id)
+            votes = 1  # 自选票已落盘
             last_log_seq, last_log_digest = self.seglog.tip()
             body = {
                 "term": new_term,
@@ -1561,8 +1571,7 @@ class Kernel:
             need = len(peers) // 2 + 1
             peer_urls = [u for nid, u in peers if nid != self.cluster.node_id]
 
-        # ---- 阶段 1（锁外 RPC）：先确认能拿到多数派，本节点状态暂不改变 ----
-        votes = 0
+        # ---- 阶段 1（锁外 RPC）：向其他成员拉票，自选票已落盘 ----
         refusals: list[dict] = []
         for url in peer_urls:
             try:
@@ -1583,22 +1592,22 @@ class Kernel:
                 refusals.append({"peer": url, "reason": getattr(e, "code", "unreachable")})
 
         with self.meta_lock:
-            if votes + 1 < need:
-                # 竞选失败：不落自选票、不推进任期，调用方可修正后重试
-                raise err(409, "election_lost",
-                          "did not reach a majority; only one candidate can win a term",
-                          term=new_term, votes=votes, needed=need - 1,
-                          refusals=refusals)
-            # ---- 阶段 2：拿到多数派承诺后，再原子落自选票/就任 ----
-            # 期间本地任期可能被后台线程前滚；那时承诺作废，必须重新竞选。
+            # 期间本地任期可能被后台线程（复制/租约心跳）前滚；那时承诺作废。
             if self.cluster.term > new_term:
                 raise err(409, "stale_term",
                           "term advanced while campaigning; aborting promotion")
+            if votes < need:
+                # 竞选失败：自选票与新任期已经落盘（标准选举语义），
+                # 败者不会重复使用该任期，调用方须以更高任期重试。
+                raise err(409, "election_lost",
+                          "did not reach a majority; only one candidate can win a term",
+                          term=new_term, votes=votes, needed=need,
+                          refusals=refusals)
+            # ---- 阶段 2：多数派承诺已在手，自选票此前已原子落盘，直接就任 ----
             if self.cluster.term == new_term and \
-                    self.cluster.s.voted_for not in (None, self.cluster.node_id):
+                    self.cluster.s.voted_for != self.cluster.node_id:
                 raise err(409, "already_voted",
                           "voted for another candidate in this term")
-            self.cluster.cast_vote(new_term, self.cluster.node_id)
             self.cluster.assume_leadership(new_term, ttl)
             # 提升成功：停止跟随来源（后台复制线程检测到角色后自动退出）
             self.replica.peer_url = None
@@ -1607,11 +1616,11 @@ class Kernel:
             self.checkpoints.append_audit({
                 "kind": "promoted", "term": new_term,
                 "last_log_seq": last_log_seq, "grant_ttl_ms": ttl,
-                "votes": votes + 1, "needed": need,
+                "votes": votes, "needed": need,
             })
             return {
                 "term": new_term, "role": PRIMARY,
-                "votes": votes + 1, "needed": need,
+                "votes": votes, "needed": need,
                 "grant_expires_at": self.cluster.s.grant_expires_at,
                 "last_log_seq": last_log_seq,
             }
