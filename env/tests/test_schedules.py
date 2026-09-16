@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 
@@ -194,6 +195,72 @@ class TestOrdering:
         k.scheduler_tick()
         assert k.get_schedule("earlier")["first_seq"] == 1
         assert k.get_schedule("later")["first_seq"] == 2
+
+    def test_tick_yields_meta_lock_between_schedules_to_pending_append(self, tmp_path):
+        k = make_kernel(tmp_path, "solo", peers={})
+        now = now_ms()
+        for rid in ("a", "b", "c"):
+            k.create_schedule(rid, now - 1, [put("sched", rid)])
+
+        enter_second_schedule = threading.Event()
+        release_second_schedule = threading.Event()
+        appended = threading.Event()
+        events: list[str] = []
+        original_append_record = k._append_record_locked
+
+        def hooked_append_record(rec_type, payload):
+            key = payload.get("key")
+            if key == "sched" and payload.get("value") == "b":
+                events.append("second-schedule-start")
+                enter_second_schedule.set()
+                release_second_schedule.wait(2)
+                events.append("second-schedule-end")
+            elif key == "sched" and payload.get("value") == "c":
+                events.append("third-schedule-start")
+            elif key == "live":
+                events.append("append")
+                appended.set()
+            return original_append_record(rec_type, payload)
+
+        k._append_record_locked = hooked_append_record
+
+        def run_tick():
+            events.append("tick-start")
+            k.scheduler_tick()
+            events.append("tick-end")
+
+        tick = threading.Thread(target=run_tick)
+        tick.start()
+        assert enter_second_schedule.wait(2)
+        writer_errors: list[Exception] = []
+
+        def run_append():
+            try:
+                k.append("put", {"key": "live", "value": 1},
+                         write_id="live-1", wait_commit=False)
+            except Exception as exc:
+                writer_errors.append(exc)
+
+        writer = threading.Thread(target=run_append)
+        writer.start()
+
+        # writer 已在 meta_lock 上排队后，scheduler 必须在第二/三个待办之前放行它。
+        deadline = time.monotonic() + 2
+        while not k._append_waiters and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert k._append_waiters
+        release_second_schedule.set()
+        assert appended.wait(2)
+        tick.join(2)
+        writer.join(2)
+        assert not tick.is_alive() and not writer.is_alive()
+        assert not writer_errors
+        assert events.index("append") < events.index("third-schedule-start")
+        assert events.index("second-schedule-end") < events.index("append")
+        assert k.get_schedule("a")["first_seq"] == 1
+        # 写请求被插入到待办 a 与 b 之间；待办彼此的先后关系仍是 a,b,c。
+        assert k.read(1, 5)["records"][2]["payload"] == {"key": "live", "value": 1}
+        assert [k.get_schedule(rid)["first_seq"] for rid in ("a", "b", "c")] == [1, 2, 4]
 
 
 # ---------------------------------------------------------------- 改期/取消/版本

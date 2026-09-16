@@ -15,6 +15,7 @@ import dataclasses
 import fcntl
 import os
 import threading
+from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
 from .batches import ABORTED, COMMITTED, COMMITTING, EXPIRED, OPEN, Batch, BatchStore, ops_hash
@@ -145,6 +146,12 @@ class Kernel:
             self.replica.persist()
 
         self.meta_lock = threading.RLock()
+        # 调度循环在每个预约之间释放 meta_lock。已到达 append 入口的写请求
+        # 登记在这里，调度器会等它们至少拿到一次 meta_lock 后再继续，避免
+        # RLock 非公平导致调度线程刚释放又立刻抢到锁、写请求被整轮饿死。
+        self._scheduler_lock = threading.Lock()
+        self._append_admit_cv = threading.Condition()
+        self._append_waiters: set[object] = set()
         # 提交事件由处理 ack 的线程持独立条件锁广播；等待提交的写线程
         # 先在 meta_lock 内检查状态、再在此条件上释放锁等待，被唤醒后
         # 重新进入 meta_lock 复核，避免「提交发生在检查与等待之间」的窗口。
@@ -862,33 +869,73 @@ class Kernel:
           生效时间严格按创建顺序，后一个能看到前一个完成后的状态；
         - 单轮最多处理 catchup_batch_limit 个（停机积压的补跑同样受限），
           超出留到下一轮，不阻塞即时写入；
+        - 每个预约处理完都释放 meta_lock，并等待已在入口排队的 /append 写请求
+          获得一次执行机会；整轮不会连续占住写路径。预约本身仍由
+          _scheduler_lock 串行选择，两个 tick 不会打乱先后关系；
         - 执行不等待多数派：记录本地持久化后即返回，成员确认由后续 ack /
           推送周期推进，下一轮 tick 再对账 applied；成员不足时停在 executing、
           保留原日志位置，恢复后续跑。
         """
-        with self.meta_lock:
-            if self.cluster.role != PRIMARY or not self.cluster.grant_valid():
-                return {"ran": 0, "reason": "not_writable_primary"}
-            self._reconcile_executing_locked()
-            now = self._now()
-            due = self.schedules.due_order(now, limit=self.cfg.catchup_batch_limit)
+        with self._scheduler_lock:
+            with self.meta_lock:
+                if self.cluster.role != PRIMARY or not self.cluster.grant_valid():
+                    return {"ran": 0, "reason": "not_writable_primary"}
+                self._reconcile_executing_locked()
+                now = self._now()
+                due = self.schedules.due_order(now, limit=self.cfg.catchup_batch_limit)
+                chosen = [s.request_id for s in due]
+
             ran = 0
             results: list[dict] = []
-            for s in due:
-                # 领取与取消/改期在同一把 meta_lock 上串行，竞争结果唯一
-                if s.status == EXECUTING:
-                    out = self._continue_schedule_locked(s, transport)
-                elif s.status == PENDING:
-                    out = self._claim_and_append_locked(s)
-                else:
-                    continue
+            for rid in chosen:
+                with self.meta_lock:
+                    # 领取与取消/改期在同一把 meta_lock 上串行，竞争结果唯一。
+                    # 选择快照后若该预约被取消/改期，这里跳过，后续预约顺序不变。
+                    s = self.schedules.get(rid)
+                    if s is None or s.status not in ACTIVE or s.effective_at > now:
+                        continue
+                    if s.status == EXECUTING:
+                        out = self._continue_schedule_locked(s, transport)
+                    else:
+                        out = self._claim_and_append_locked(s)
                 ran += 1
                 results.append(out)
-            # 仍到期且尚未领取（pending）的数量：受单轮上限约束留下的积压
-            left = [s for s in self.schedules.due_order(now) if s.status == PENDING]
+                self._yield_to_append_waiters()
+
+            with self.meta_lock:
+                # 仍到期且尚未领取（pending）的数量：受单轮上限约束留下的积压
+                left = [s for s in self.schedules.due_order(now) if s.status == PENDING]
             return {"ran": ran, "now": now,
-                    "remaining_due": len(left),
-                    "results": results}
+                    "results": results,
+                    "remaining_due": len(left)}
+
+    @contextmanager
+    def _append_admission(self):
+        """在排队 meta_lock 前登记写请求，供调度器在预约之间显式放行。"""
+        token = object()
+        with self._append_admit_cv:
+            self._append_waiters.add(token)
+        try:
+            yield
+        finally:
+            with self._append_admit_cv:
+                self._append_waiters.discard(token)
+                self._append_admit_cv.notify_all()
+
+    def _yield_to_append_waiters(self) -> None:
+        """在两个预约之间放行所有已进入 append 入口的写请求。
+
+        仅释放 meta_lock 仍依赖 RLock 的非公平调度，调度线程可能立刻再次获
+        锁；因此 append 先在条件变量上登记，等其真正拿到 meta_lock 后撤销
+        登记。此处等待的是边界时刻已存在的写请求，后续持续到达的新请求不会
+        让调度器永久饥饿。
+        """
+        with self._append_admit_cv:
+            waiting = set(self._append_waiters)
+        for token in waiting:
+            with self._append_admit_cv:
+                self._append_admit_cv.wait_for(
+                    lambda: token not in self._append_waiters)
 
     def _reconcile_executing_locked(self) -> None:
         """把「记录已越提交水位」的 executing 预约标记 applied（幂等）。"""
@@ -1068,7 +1115,7 @@ class Kernel:
         """
         timeout = self._clamp_commit_timeout(timeout_ms)
         wid = self._validate_write_id(write_id)
-        with self.meta_lock:
+        with self._append_admission(), self.meta_lock:
             self._require_writable_primary()
             term = self.cluster.term
             existing = self.commit.get_write(wid)
