@@ -48,6 +48,18 @@ from .consensus import CommitStore, Proposal, new_write_id
 from .readers import ReaderStore
 from .reducer import Reducer
 from .replica import CAUGHT_UP, CONFLICT, IDLE, SYNCING, ReplicaStore
+from .schedules import (
+    ACTIVE,
+    APPLIED,
+    CANCELLED,
+    EXECUTING,
+    PENDING,
+    SUPERSEDED,
+    ScheduleStore,
+    exec_batch_id,
+    exec_write_id,
+    schedule_content_hash,
+)
 from .segment import SegmentLog, record_digest
 
 
@@ -73,6 +85,10 @@ class Config:
     replica_source: Optional[str] = None  # 首次以 standby 引导时的来源 URL
     commit_timeout_ms: int = 3_000      # 多数派提交等待上限（超时返回 commit_timeout）
     read_barrier_timeout_ms: int = 3_000  # 线性一致读屏障等待上限
+    # ---- 未来生效变更预约（scheduled changes）----
+    scheduler_enabled: bool = True      # 到期领取后台线程（仅主实例实际领取）
+    scheduler_interval_ms: int = 200    # 调度轮询间隔
+    catchup_batch_limit: int = 100      # 单轮补跑/单轮到期处理上限（超出留下一轮）
 
 
 def _vfail(reason: Any, proof: dict | None = None) -> dict:
@@ -113,6 +129,16 @@ class Kernel:
         self.replica = ReplicaStore(os.path.join(self.state_dir, "replica.json"))
         # ---- 多数派提交水位 / 待定提议 / write_id 登记 / 成员确认位置 ----
         self.commit = CommitStore(os.path.join(self.state_dir, "commit.json"))
+        # ---- 未来生效变更预约 ----
+        self.schedules = ScheduleStore(os.path.join(self.state_dir, "schedules.json"))
+        # 可注入的墙上时钟（测试时钟回拨/停机补跑）；缺省走真实时间。
+        self._clock: Optional[Callable[[], int]] = None
+        # schedule 执行记录跨度：{(first_seq,last_seq): request_id}，
+        # 供重启后重建待定提议时把整组识别为一个不可拆开的 schedule 提议。
+        self._schedule_spans: dict[tuple[int, int], str] = {}
+        for sc in self.schedules.schedules.values():
+            if sc.status in ACTIVE and sc.first_seq is not None and sc.last_seq is not None:
+                self._schedule_spans[(int(sc.first_seq), int(sc.last_seq))] = sc.request_id
         if self.cluster.fresh and cfg.bootstrap_role == STANDBY and cfg.replica_source:
             self.replica.peer_url = cfg.replica_source.rstrip("/")
             self.replica.status = SYNCING
@@ -196,6 +222,7 @@ class Kernel:
             self._reconcile_head()
             recovery["replica"] = self._reconcile_replica()
             recovery["commit"] = self._reconcile_commit()
+            recovery["schedules"] = self._recover_schedules()
             return recovery
 
     def _finish_prefix_cleanup(self, pointer: dict, pending_seq: int) -> list[int]:
@@ -397,6 +424,47 @@ class Kernel:
                 "pending": len(cs.pending),
                 "dormant_writes": dormant}
 
+    def _recover_schedules(self) -> dict:
+        """启动时对账预约（在提交水位/待定提议重建之后）。
+
+        - executing 且整组已越提交水位 -> applied（时钟回拨也不会重跑）；
+        - executing 但整组记录已不在链上（被更新任期截断）-> 纪元前滚、
+          回 pending，由当前主在新位置按原请求标识重做；
+        - executing 记录仍在链但待定 -> 重建 write 登记/跨度，保持 executing
+          可重试；pending 待补跑的不动，调度器按原顺序补跑。
+        """
+        applied: list[str] = []
+        retried: list[str] = []
+        waiting: list[str] = []
+        for s in self.schedules.schedules.values():
+            if s.status not in ACTIVE:
+                continue
+            if s.first_seq is not None and s.last_seq is not None:
+                present = self._span_present(int(s.first_seq), int(s.last_seq))
+                self._schedule_spans[(int(s.first_seq), int(s.last_seq))] = s.request_id
+                if present and self.commit.commit_index >= int(s.last_seq):
+                    if s.status != APPLIED:
+                        self.schedules.mark_applied(
+                            s, int(s.first_seq), int(s.last_seq),
+                            s.executed_term or self.cluster.term, self._now())
+                    applied.append(s.request_id)
+                    continue
+                if not present:
+                    self._schedule_spans.pop((int(s.first_seq), int(s.last_seq)), None)
+                    self._reset_schedule_for_retry(s, reason="truncated_by_new_term")
+                    retried.append(s.request_id)
+                    continue
+                # 记录在链、水位未到：重建 write 登记，保持 executing
+                if s.write_id and self.commit.get_write(s.write_id) is None:
+                    self.commit.register_write(
+                        s.write_id, s.executed_term or self.cluster.term,
+                        int(s.first_seq), int(s.last_seq),
+                        kind="schedule", batch_id=s.request_id)
+                    self.commit.persist()
+                waiting.append(s.request_id)
+        return {"applied": applied, "retried": retried, "waiting": waiting,
+                "pending": self.schedules.counts()[PENDING]}
+
     def _rebuild_pending_locked(self) -> None:
         """依据现存链、write_id 登记与 committing 批次重建 commit_index 之后的待定提议。
 
@@ -432,6 +500,17 @@ class Kernel:
                     seq, last_seq, term=self.commit.term_at(seq), kind="batch",
                     write_id=batch.write_id, batch_id=batch.batch_id))
                 seq = last_seq + 1
+                continue
+            # schedule 整组：以登记的跨度识别为一个不可拆开的提议
+            sched_span = next(((f, l, rid) for (f, l), rid in self._schedule_spans.items()
+                               if f == seq), None)
+            if sched_span is not None:
+                f0, l0, rid = sched_span
+                sc = self.schedules.get(rid)
+                proposals.append(Proposal(
+                    f0, l0, term=self.commit.term_at(f0), kind="schedule",
+                    write_id=(sc.write_id if sc else None), request_id=rid))
+                seq = l0 + 1
                 continue
             entry = None
             for e in cs.writes.values():
@@ -583,6 +662,363 @@ class Kernel:
                       "leadership grant for this term has expired; "
                       "a new election is required",
                       term=self.cluster.term)
+
+    # =====================================================================
+    # 未来生效变更预约（scheduled changes）
+    # =====================================================================
+
+    MAX_SCHEDULE_OPS = 10_000
+
+    def set_clock(self, fn: Optional[Callable[[], int]]) -> None:
+        """注入墙上时钟（毫秒）；测试时钟回拨/停机补跑用。None 恢复真实时钟。"""
+        self._clock = fn
+
+    def _now(self) -> int:
+        return int(self._clock()) if self._clock is not None else now_ms()
+
+    def _validate_schedule_ops(self, ops: Any) -> list[dict]:
+        if not isinstance(ops, list) or not ops:
+            raise err(400, "bad_request", "ops must be a non-empty list of put/delete ops")
+        if len(ops) > self.MAX_SCHEDULE_OPS:
+            raise err(413, "schedule_too_large",
+                      f"schedule would exceed {self.MAX_SCHEDULE_OPS} ops")
+        normed: list[dict] = []
+        for op in ops:
+            if not isinstance(op, dict) or op.get("type") not in ("put", "delete"):
+                raise err(400, "bad_request",
+                          "each schedule op must be put or delete with a payload")
+            # 入预约前校验业务负载，坏操作绝不进预约/日志
+            Reducer().apply(op["type"], op.get("payload"))
+            normed.append({"type": op["type"], "payload": op.get("payload")})
+        return normed
+
+    def create_schedule(self, request_id: Any, effective_at: Any, ops: Any,
+                        expected_version: Optional[int] = None) -> dict:
+        """创建（或幂等重放）一个未来生效的预约。
+
+        - 相同 request_id + 相同内容 -> 返回原预约（replay:true），不重复安排；
+        - 相同 request_id + 不同内容 -> 409 schedule_conflict；
+        - 终态/执行中的相同请求也走原记录返回，绝不重建。
+        """
+        rid = self._validate_request_id(request_id)
+        at = self._validate_effective_at(effective_at)
+        normed = self._validate_schedule_ops(ops)
+        content_hash = schedule_content_hash(normed)
+        with self.meta_lock:
+            self._require_writable_primary()
+            existing = self.schedules.get(rid)
+            if existing is not None:
+                if existing.content_hash != content_hash or \
+                        existing.effective_at != at:
+                    # 相同请求不同内容/时间：明确拒绝（改期请走 reschedule）
+                    raise err(409, "schedule_conflict",
+                              "request_id already used with different content or "
+                              "effective time",
+                              request_id=rid, schedule_status=existing.status,
+                              version=existing.version,
+                              existing_effective_at=existing.effective_at)
+                return self._schedule_view(existing, replay=True)
+            s = self.schedules.create(rid, at, normed, content_hash,
+                                      self.cluster.term, self._now())
+            return self._schedule_view(s, replay=False, created=True)
+
+    @staticmethod
+    def _validate_request_id(request_id: Any) -> str:
+        if not isinstance(request_id, str) or not (1 <= len(request_id) <= 256):
+            raise err(400, "bad_request",
+                      "request_id must be a string of length 1..256")
+        if any(c in request_id for c in "/\\\n\r\t\0"):
+            raise err(400, "bad_request", "request_id contains illegal characters")
+        return request_id
+
+    def _validate_effective_at(self, effective_at: Any) -> int:
+        if isinstance(effective_at, bool) or not isinstance(effective_at, int):
+            raise err(400, "bad_request",
+                      "effective_at must be an integer epoch in milliseconds")
+        if effective_at < 0:
+            raise err(400, "bad_request", "effective_at must be >= 0")
+        if effective_at - self._now() > 366 * 24 * 3600 * 1000:
+            raise err(400, "bad_request", "effective_at too far in the future")
+        return effective_at
+
+    def reschedule(self, request_id: str, effective_at: Any,
+                   expected_version: Any) -> dict:
+        """携带当前版本改期：只有 pending 且版本匹配才能改到新时间。"""
+        rid = self._validate_request_id(request_id)
+        at = self._validate_effective_at(effective_at)
+        ver = self._validate_version(expected_version)
+        with self.meta_lock:
+            self._require_writable_primary()
+            s = self._require_schedule(rid)
+            if s.status == EXECUTING or s.status == APPLIED:
+                raise err(409, "already_started",
+                          "schedule execution has already started; cannot reschedule",
+                          request_id=rid, schedule_status=s.status, version=s.version)
+            if s.status in (CANCELLED, SUPERSEDED):
+                raise err(409, "schedule_closed",
+                          f"schedule is {s.status}; cannot reschedule",
+                          request_id=rid, schedule_status=s.status)
+            if ver != s.version:
+                raise err(409, "version_conflict",
+                          "expected_version is stale; a newer arrangement exists",
+                          request_id=rid, expected_version=ver,
+                          current_version=s.version)
+            self.schedules.reschedule(s, at, self._now())
+            return self._schedule_view(s)
+
+    def cancel_schedule(self, request_id: str, expected_version: Any) -> dict:
+        """携带当前版本取消：pending 且版本匹配才成功。
+
+        与到期领取竞争时由 meta_lock 串行化，结果唯一：
+        领取先到 -> executing/applied，取消拿到 409 already_started（执行成功）；
+        取消先到 -> cancelled，领取跳过它（取消成功、无业务变更）。
+        """
+        rid = self._validate_request_id(request_id)
+        ver = self._validate_version(expected_version)
+        with self.meta_lock:
+            self._require_writable_primary()
+            s = self._require_schedule(rid)
+            if s.status == CANCELLED:
+                # 取消幂等：同版本重复取消返回原结果
+                return self._schedule_view(s, replay=True)
+            if s.status in (EXECUTING, APPLIED):
+                raise err(409, "already_started",
+                          "schedule execution has already started; cancel rejected",
+                          request_id=rid, schedule_status=s.status, version=s.version)
+            if s.status == SUPERSEDED:
+                raise err(409, "schedule_closed",
+                          "schedule was superseded; cannot cancel",
+                          request_id=rid, schedule_status=s.status, version=s.version)
+            if ver != s.version:
+                raise err(409, "version_conflict",
+                          "expected_version is stale; a newer arrangement exists",
+                          request_id=rid, expected_version=ver,
+                          current_version=s.version)
+            self.schedules.cancel(s, self._now())
+            return self._schedule_view(s, cancelled=True)
+
+    @staticmethod
+    def _validate_version(version: Any) -> int:
+        if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+            raise err(400, "bad_request",
+                      "expected_version must be a positive integer")
+        return version
+
+    def _require_schedule(self, rid: str):
+        s = self.schedules.get(rid)
+        if s is None:
+            raise err(404, "not_found", f"unknown schedule request_id {rid!r}")
+        return s
+
+    def get_schedule(self, request_id: str) -> dict:
+        with self.meta_lock:
+            return self._schedule_view(self._require_schedule(request_id))
+
+    def list_schedules(self, status: Optional[str] = None) -> dict:
+        with self.meta_lock:
+            items = self.schedules.list()
+            if status:
+                items = [s for s in items if s.status == status]
+            return {"schedules": [self._schedule_view(s) for s in items],
+                    "counts": self.schedules.counts()}
+
+    def _schedule_view(self, s, replay: bool = False, created: bool = False,
+                       cancelled: bool = False) -> dict:
+        v = {
+            "request_id": s.request_id,
+            "effective_at": s.effective_at,
+            "version": s.version,
+            "status": s.status,
+            "op_count": len(s.ops),
+            "content_hash": s.content_hash,
+            "seq": s.seq,
+            "created_at": s.created_at,
+            "created_term": s.created_term,
+            "epoch": s.epoch,
+            "write_id": s.write_id,
+            "batch_id": s.batch_id,
+            "attempt_count": s.attempt_count,
+            "executed_term": s.executed_term,
+            "first_seq": s.first_seq,
+            "last_seq": s.last_seq,
+            "applied_at": s.applied_at,
+            "cancelled_at": s.cancelled_at,
+            "supersede_reason": s.supersede_reason,
+        }
+        if replay:
+            v["replay"] = True
+        if created:
+            v["created"] = True
+        if cancelled:
+            v["cancelled"] = True
+        return v
+
+    # ---------- 到期领取与执行（仅当前可写主）----------
+
+    def scheduler_tick(self, transport: Optional[Callable] = None) -> dict:
+        """一轮调度：对账执行中预约、按顺序领取到期预约（受单轮上限约束）。
+
+        - 只处理到期 active 预约，按 (effective_at, 创建 seq) 排序，因此同一
+          生效时间严格按创建顺序，后一个能看到前一个完成后的状态；
+        - 单轮最多处理 catchup_batch_limit 个（停机积压的补跑同样受限），
+          超出留到下一轮，不阻塞即时写入；
+        - 执行不等待多数派：记录本地持久化后即返回，成员确认由后续 ack /
+          推送周期推进，下一轮 tick 再对账 applied；成员不足时停在 executing、
+          保留原日志位置，恢复后续跑。
+        """
+        with self.meta_lock:
+            if self.cluster.role != PRIMARY or not self.cluster.grant_valid():
+                return {"ran": 0, "reason": "not_writable_primary"}
+            self._reconcile_executing_locked()
+            now = self._now()
+            due = self.schedules.due_order(now, limit=self.cfg.catchup_batch_limit)
+            ran = 0
+            results: list[dict] = []
+            for s in due:
+                # 领取与取消/改期在同一把 meta_lock 上串行，竞争结果唯一
+                if s.status == EXECUTING:
+                    out = self._continue_schedule_locked(s, transport)
+                elif s.status == PENDING:
+                    out = self._claim_and_append_locked(s)
+                else:
+                    continue
+                ran += 1
+                results.append(out)
+            # 仍到期且尚未领取（pending）的数量：受单轮上限约束留下的积压
+            left = [s for s in self.schedules.due_order(now) if s.status == PENDING]
+            return {"ran": ran, "now": now,
+                    "remaining_due": len(left),
+                    "results": results}
+
+    def _reconcile_executing_locked(self) -> None:
+        """把「记录已越提交水位」的 executing 预约标记 applied（幂等）。"""
+        ci = self.commit.commit_index
+        for s in self.schedules.schedules.values():
+            if s.status == EXECUTING and s.last_seq is not None and ci >= int(s.last_seq):
+                self.schedules.mark_applied(
+                    s, int(s.first_seq), int(s.last_seq),
+                    s.executed_term or self.cluster.term, self._now())
+
+    def _claim_and_append_locked(self, s) -> dict:
+        """领取一个 pending 预约并把整组记录原子地追加到本地链。
+
+        整组作为一个 kind=schedule 提议登记，提交水位只会越过整组边界，
+        到期操作要么全部生效、要么完全不生效。复用确定性派生的
+        batch/write 标识，接管的主沿用原请求标识完成同一提交。
+        """
+        term = self.cluster.term
+        epoch = s.epoch + 1
+        bid = exec_batch_id(s.request_id)
+        wid = exec_write_id(s.request_id, epoch)
+        first_seq = self.seglog.next_seq
+        # 领取意图先落盘：崩溃/切换后新主据此判断是否已开始、沿用何纪元
+        self.schedules.claim(s, epoch, bid, wid, term, self._now())
+        try:
+            for op in s.ops:
+                self._append_record_locked(op["type"], op["payload"])
+            last_seq = first_seq + len(s.ops) - 1
+        except Exception:
+            # 本地追加失败：整批回滚链尾，预约回到 pending 留待下轮重做
+            self._rollback_schedule_append(s, first_seq)
+            raise
+        s.first_seq, s.last_seq = first_seq, last_seq
+        self._schedule_spans[(first_seq, last_seq)] = s.request_id
+        self.commit.register_write(wid, term, first_seq, last_seq,
+                                   kind="schedule", batch_id=s.request_id)
+        self.commit.add_proposal(Proposal(
+            first_seq, last_seq, term=term, kind="schedule",
+            write_id=wid, request_id=s.request_id))
+        self.commit.persist()
+        self.schedules.persist()
+        self._advance_commit_locked()
+        # 单节点（仅自己一个投票成员）通常当场越过提交水位
+        if self.commit.commit_index >= last_seq:
+            self.schedules.mark_applied(s, first_seq, last_seq, term, self._now())
+            return {"request_id": s.request_id, "status": APPLIED,
+                    "first_seq": first_seq, "last_seq": last_seq}
+        return {"request_id": s.request_id, "status": EXECUTING,
+                "first_seq": first_seq, "last_seq": last_seq, "epoch": epoch}
+
+    def _continue_schedule_locked(self, s, transport: Optional[Callable]) -> dict:
+        """继续一个 executing 预约：沿用原 write_id/位置，绝不重复执行。
+
+        - 已越提交水位 -> applied；
+        - write 登记缺失（截断后未重建等）/ 本地记录不在链上（被更新任期截断）
+          -> 纪元前滚，回到 pending 在新位置重做（旧 write_id 已 superseded，
+             旧实例迟到结果不可能被写成成功）；
+        - 仍是本任期待定 -> 保持 executing、原位置，尝试推进水位
+          （成员不足时停在此处可重试，恢复后续跑）。
+        """
+        first = s.first_seq
+        last = s.last_seq
+        wid = s.write_id
+        term = s.executed_term or self.cluster.term
+        entry = self.commit.get_write(wid) if wid else None
+        records_present = first is not None and last is not None and \
+            self._span_present(int(first), int(last))
+        if last is not None and self.commit.commit_index >= int(last) and records_present:
+            self.schedules.mark_applied(s, int(first), int(last), term, self._now())
+            return {"request_id": s.request_id, "status": APPLIED,
+                    "first_seq": int(first), "last_seq": int(last), "retry": True}
+        # 被更新任期截断：旧位置记录已不在链上，或 write 登记被标 superseded
+        superseded = entry is not None and entry.get("status") == "superseded"
+        if not records_present or superseded:
+            self._reset_schedule_for_retry(s, reason="truncated_by_new_term")
+            return self._claim_and_append_locked(s)
+        if entry is None:
+            # 登记缺失但记录在链（理论兜底）：重建登记后继续等同一位置
+            self.commit.register_write(wid, term, int(first), int(last),
+                                       kind="schedule", batch_id=s.request_id)
+            self.commit.persist()
+        # 仍是当前主：尝试推进；不阻塞，下轮再来
+        self._advance_commit_locked()
+        self.schedules.record_attempt_error(s, self._now())
+        if self.commit.commit_index >= int(last):
+            self.schedules.mark_applied(s, int(first), int(last), term, self._now())
+            return {"request_id": s.request_id, "status": APPLIED,
+                    "first_seq": int(first), "last_seq": int(last), "retry": True}
+        return {"request_id": s.request_id, "status": EXECUTING,
+                "first_seq": int(first), "last_seq": int(last),
+                "retry": True, "commit_index": self.commit.commit_index}
+
+    def _span_present(self, first_seq: int, last_seq: int) -> bool:
+        """整组记录是否完整连续地留在链上（含与前驱的摘要衔接）。"""
+        if first_seq <= 0 or last_seq < first_seq:
+            return False
+        n = last_seq - first_seq + 1
+        recs = self.seglog.read_records(first_seq, n)
+        if len(recs) != n:
+            return False
+        anchor = self._digest_or_anchor(first_seq - 1)
+        for i, r in enumerate(recs):
+            if r["seq"] != first_seq + i or r["prev"] != anchor:
+                return False
+            anchor = r["digest"]
+        return True
+
+    def _rollback_schedule_append(self, s, first_seq: int) -> None:
+        """本地追加失败：截断链尾、清登记，预约回到 pending（不留半组/空洞）。"""
+        keep = first_seq - 1
+        if self.seglog.tip()[0] > keep:
+            self.seglog.truncate_tail(keep)
+        if self.commit.commit_index > keep:
+            self.commit.commit_index = keep
+            self.commit.commit_digest = self._digest_or_anchor(keep) or GENESIS
+        self.commit.prune_pending_through(keep)
+        self.commit.persist()
+        s.status = PENDING
+        s.first_seq = s.last_seq = None
+        self.schedules.persist()
+        self._persist_head()
+
+    def _reset_schedule_for_retry(self, s, reason: str) -> None:
+        """日志被更新任期截断：纪元前滚、回 pending，以便在新位置重做整组。"""
+        s.status = PENDING
+        s.epoch += 1  # 派生新 write_id；旧 write_id 已 superseded
+        s.first_seq = s.last_seq = None
+        s.batch_id = s.write_id = None
+        s.supersede_reason = None
+        self.schedules.persist()
 
     def _validate_write_id(self, write_id: Any) -> str:
         if write_id is None:
@@ -1994,6 +2430,8 @@ class Kernel:
                      "state_digest": pointer["state_digest"],
                      "snapshot_digest": pointer["snapshot_digest"],
                      "manifest_digest": pointer["manifest_digest"]}),
+                # 预约元数据随边界带给备实例，使新主提升后能接管未完成预约
+                "schedules": self.schedules.snapshot(),
             }
 
     def export_records(self, from_seq: int, limit: int, expected_term: int = 0) -> dict:
@@ -2024,6 +2462,7 @@ class Kernel:
                 # 只能在哪些边界推进，原子批次不会被水位拆成两半。
                 "pending": [p.to_dict() for p in self.commit.pending],
                 "term_markers": self.commit.term_marker_view(),
+                "schedules": self.schedules.snapshot(),
                 "records": recs,
                 "next": recs[-1]["seq"] + 1 if recs else from_seq,
             }
@@ -2135,6 +2574,9 @@ class Kernel:
                     "checkpoint_gen": cp["gen"] if cp else 0,
                     "checkpoint_seq": cp["seq"] if cp else 0,
                 })
+                # 预约元数据即使没有新记录也要随边界对账（备提升后能接管）
+                if isinstance(bnd.get("schedules"), dict):
+                    self._merge_primary_schedules(bnd["schedules"])
 
                 # 旧主转备/手工配置：已确认位置为 0 但本地链非空。
                 # 只有当来源承认本地历史（本地 tip 在来源历史上）时，才把
@@ -2374,6 +2816,20 @@ class Kernel:
         if isinstance(pending, list):
             self.commit.replace_pending([Proposal.from_dict(p) for p in pending])
         self.commit.persist()
+        # 预约元数据随复制页对账（备只读镜像，提升后据此接管未完成预约）
+        if isinstance(page.get("schedules"), dict):
+            self._merge_primary_schedules(page["schedules"])
+
+    def _merge_primary_schedules(self, snap: dict) -> None:
+        changed = self.schedules.merge_primary(snap, now=self._now())
+        if not changed:
+            return
+        # 重建执行中预约的跨度索引
+        self._schedule_spans = {}
+        for sc in self.schedules.schedules.values():
+            if sc.status in ACTIVE and sc.first_seq is not None \
+                    and sc.last_seq is not None:
+                self._schedule_spans[(int(sc.first_seq), int(sc.last_seq))] = sc.request_id
 
     def _raise_conflict(self, seq: int, expected: Any, got: Any, reason: str) -> None:
         self.replica.mark_error(
@@ -2740,6 +3196,17 @@ class Kernel:
                 if wid and self.commit.get_write(wid):
                     self.commit.mark_write_superseded(wid, new_term)
                 self.batches.rollback_to_open(b)
+        # schedule：执行中整组任何记录超出可证前缀 -> 纪元前滚回 pending，
+        # 由新主沿用原请求标识在新位置重做（旧 write_id 已 superseded）。
+        for sc in list(self.schedules.schedules.values()):
+            if sc.status == EXECUTING and sc.first_seq is not None \
+                    and int(sc.first_seq) > target:
+                if sc.write_id and self.commit.get_write(sc.write_id):
+                    self.commit.mark_write_superseded(sc.write_id, new_term)
+                if sc.first_seq is not None and sc.last_seq is not None:
+                    self._schedule_spans.pop(
+                        (int(sc.first_seq), int(sc.last_seq)), None)
+                self._reset_schedule_for_retry(sc, reason="truncated_by_new_term")
         self.commit.prune_pending_through(target)
         self.commit.commit_index = min(self.commit.commit_index, target)
         self.commit.commit_digest = self._digest_or_anchor(self.commit.commit_index) or GENESIS
@@ -3077,5 +3544,6 @@ class Kernel:
                 "commit_term": self.commit.commit_term,
                 "pending": self.commit.pending_ranges(),
                 "member_acks": self._member_ack_view(),
+                "schedules": self.schedules.counts(),
                 "data_dir": self.cfg.data_dir,
             }

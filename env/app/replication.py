@@ -190,6 +190,29 @@ class LeaderPusher(_StopLoop):
                 pass
 
 
+class Scheduler(_StopLoop):
+    """到期预约领取线程：仅当前可写主实际领取，备/授权失效时空转。
+
+    每轮按 (effective_at, 创建顺序) 领取至多 catchup_batch_limit 个到期
+    预约（停机积压补跑同样受限，超出留下一轮），不等待多数派确认；成员
+    确认由 LeaderPusher / 备库 ack 推进，下一轮再对账 applied。
+    """
+
+    def __init__(self, kernel, interval_ms: int, transport: Optional[Transport] = None):
+        super().__init__("scheduler", max(0.02, interval_ms / 1000))
+        self.k = kernel
+        self.transport = transport or http_transport
+
+    def run(self) -> None:
+        while not self.stop_evt.wait(self.interval):
+            try:
+                if self.k.cluster.role != "primary" or not self.k.cluster.grant_valid():
+                    continue
+                self.k.scheduler_tick(self.transport)
+            except Exception:
+                pass  # 下轮重试；预约元数据/批次均幂等，不产生半组生效
+
+
 class ClusterSupervisor(_StopLoop):
     """角色驱动的后台循环：随当前角色启动/停止拉取、续租与主动推送。
 
@@ -200,7 +223,8 @@ class ClusterSupervisor(_StopLoop):
 
     def __init__(self, kernel, replication_interval_ms: int,
                  lease_interval_ms: int, grant_ttl_ms: int,
-                 transport: Optional[Transport] = None):
+                 transport: Optional[Transport] = None,
+                 scheduler_enabled: bool = True):
         super().__init__("cluster-supervisor",
                          max(0.05, min(replication_interval_ms,
                                        lease_interval_ms) / 1000 / 2))
@@ -209,6 +233,7 @@ class ClusterSupervisor(_StopLoop):
         self.lease_interval_ms = lease_interval_ms
         self.grant_ttl_ms = grant_ttl_ms
         self.transport = transport or http_transport
+        self.scheduler_enabled = scheduler_enabled
         self._children: list[_StopLoop] = []
 
     def _stop_children(self) -> None:
@@ -224,10 +249,12 @@ class ClusterSupervisor(_StopLoop):
             "replicator": role == "standby" and (
                 bool(self.k.cfg.peers) or bool(self.k.replica.peer_url)),
             "refresher": role == "primary" and bool(self.k.cfg.peers),
-            "pusher": role == "primary" and bool(self.k.cfg.peers)}
+            "pusher": role == "primary" and bool(self.k.cfg.peers),
+            "scheduler": role == "primary" and self.scheduler_enabled}
         have = {("replicator" if isinstance(c, Replicator)
                  else "refresher" if isinstance(c, LeaseRefresher)
-                 else "pusher" if isinstance(c, LeaderPusher) else "?"): c
+                 else "pusher" if isinstance(c, LeaderPusher)
+                 else "scheduler" if isinstance(c, Scheduler) else "?"): c
                 for c in self._children}
         for name, on in want.items():
             if bool(name in have) != on:
@@ -243,9 +270,12 @@ class ClusterSupervisor(_StopLoop):
                     elif name == "refresher":
                         c = LeaseRefresher(self.k, self.lease_interval_ms,
                                            self.grant_ttl_ms, self.transport)
-                    else:
+                    elif name == "pusher":
                         c = LeaderPusher(self.k, self.replication_interval_ms,
                                          self.transport)
+                    else:
+                        c = Scheduler(self.k, self.k.cfg.scheduler_interval_ms,
+                                      self.transport)
                     c.start()
                     self._children.append(c)
 

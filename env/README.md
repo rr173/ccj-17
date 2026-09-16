@@ -50,6 +50,7 @@
     ├── cluster.json            # 集群角色/单调任期/带 TTL 授权/每任期投票（重启有效）
     ├── replica.json            # 复制关系、已确认序号/摘要、来源边界、最近错误
     └── commit.json             # 多数派提交水位、待定提议、write_id 登记、成员确认位置
+    └── schedules.json          # 未来生效变更预约（请求标识/生效时间/操作/版本/执行纪元/最终日志位置）
 ```
 
 ### 1.1 记录哈希链
@@ -211,6 +212,71 @@ GET  /batches                 -> 全部批次摘要
 
 ---
 
+## 3.6 未来生效的日志变更预约（scheduled changes）
+
+调用方可以预约一组**未来到点才生效**的 put/delete 操作。每个预约包含唯一
+请求标识 `request_id`、墙上生效时间 `effective_at`（epoch 毫秒）和一组按序
+执行的操作。预约先持久化（`state/schedules.json`），到点后由**持有当前有效
+任期授权的可写主实例**领取，并作为一个**原子批次**提交：整组记录作为一个
+`kind=schedule` 提议入链，提交水位只会越过整组边界——到期操作**要么全部生效、
+要么完全不生效**，绝不会落在提交水位两侧。
+
+```
+POST /schedules          {request_id, effective_at, ops:[put|delete...]}
+GET  /schedules[?status=pending|executing|applied|cancelled|superseded]
+GET  /schedules/{request_id}
+POST /schedules/{request_id}/reschedule {effective_at, expected_version}
+POST /schedules/{request_id}/cancel     {expected_version}
+POST /schedules/tick      # 手动触发一轮调度（后台线程默认每 200ms 自动跑）
+```
+
+预约状态机与查询字段：
+
+| 状态 | 含义 |
+|---|---|
+| `pending` | 未到生效时间，或已到点未被领取（含停机错过、待补跑） |
+| `executing` | 已被主领取，整组记录已在本地链上，等待多数派确认（可重试） |
+| `applied` | 整组越过提交水位、业务一次性可见（终态），含 `first_seq/last_seq` 最终日志位置 |
+| `cancelled` | 生效开始前被携带当前版本的取消请求取消（终态，无业务变更） |
+| `superseded` | 生效开始前被改期取代，或日志被更新任期截断（终态） |
+
+**幂等与乐观版本**
+
+* 相同 `request_id` + 相同内容（操作列表与生效时间）重复创建 → 返回原预约
+  （`replay:true`），不重复安排；相同 `request_id` + 不同内容/时间 →
+  `409 schedule_conflict`。
+* 每次改期 `version += 1`。取消/改期必须携带 `expected_version`，版本过期
+  → `409 version_conflict`，**旧版本不能覆盖较新的安排**。
+* 只有 `pending` 可取消/改期；`executing/applied` 的取消得到
+  `409 already_started`。取消与到期领取在同一把元数据锁上串行，因此竞争有
+  **唯一结果**：要么取消成功且没有业务变更，要么执行成功且取消明确返回「已经开始」。
+
+**领取、接管与任期（沿用原请求标识，绝不重复执行）**
+
+* 执行批次/提交使用由 `request_id` 确定性派生的 `batch_id`/`write_id`（按领取
+  纪元 epoch 区分）。执行开始后发生进程退出、授权失效或主切换：新主从复制
+  镜像的预约元数据接管未完成预约，沿用原 `request_id` 在**同一日志位置**完成
+  提交；日志被更新任期截断时纪元前滚、在新位置重做整组，旧 `write_id` 已
+  superseded，**旧实例稍后返回的结果不可能被写成成功**。
+* 到期执行暂时得不到足够成员确认时，预约停在 `executing`、**保留原日志位置**
+  进入可重试状态；成员恢复后由后续 ack/主动推送推进提交水位，下一轮继续原过程。
+* 同一生效时间的预约严格按**创建顺序**处理（`(effective_at, seq)` 排序），
+  后一个预约必须能看到前一个预约完成后的状态。
+
+**墙上时间、时钟回拨与停机补跑**
+
+* 调度依据可持久化的墙上时间（`effective_at` 落盘）。`applied` 是终态，**系统
+  时间回拨不会让已 applied 的预约再次执行**（批次幂等登记同样去重）。
+* 停机期间错过的预约在恢复后按原顺序补跑；单轮处理受可配置的
+  `CATCHUP_BATCH_LIMIT`（默认 100）约束，超出部分留到下一轮，**不阻塞即时写入**。
+
+后台调度线程只在当前可写主上运行；备实例通过复制协议（boundary / records 页
+携带 `schedules` 镜像）只读同步预约元数据，提升为主后即可接管。新增配置项：
+`SCHEDULER_ENABLED`（默认 true）、`SCHEDULER_INTERVAL_MS`（默认 200）、
+`CATCHUP_BATCH_LIMIT`（默认 100）。
+
+---
+
 ## 4. 压缩协议（核心不变量）
 
 `POST /compact [{"force": true}]`。`force` 只绕过「可回收段数阈值」，
@@ -269,6 +335,12 @@ GET  /batches                 -> 全部批次摘要
 | `POST /batches/{id}/abort` | 放弃批次（之后不能再提交） |
 | `GET /batches/{id}` | 批次最终状态与日志序号范围 `first_seq..last_seq` |
 | `GET /batches` | 全部批次摘要 |
+| `POST /schedules` | 创建未来生效预约 `{request_id,effective_at,ops}`；相同请求+内容返回原预约，内容不同 `409` |
+| `GET /schedules[?status=]` | 预约列表（可按状态过滤）与各状态计数 |
+| `GET /schedules/{request_id}` | 预约状态与最终日志位置 `first_seq..last_seq` |
+| `POST /schedules/{request_id}/reschedule` | 携带 `expected_version` 改期（旧版本 `409 version_conflict`） |
+| `POST /schedules/{request_id}/cancel` | 携带 `expected_version` 取消（执行已开始则 `409 already_started`） |
+| `POST /schedules/tick` | 手动触发一轮到期领取（后台线程默认自动） |
 | `GET /read?from=&limit=[&consistency=linearizable]` | 读原始事件；默认只返回 `<= commit_index` 的记录（待定位置返回空页 `ahead_of_commit`）；压缩掉的序号 → `410 compacted` |
 | `GET /state[?consistency=linearizable]` | **从头读取的业务含义**：默认折叠到提交水位；线性一致读先做多数派读屏障 |
 | `GET /head` | 当前 checkpoint 与可读起点 `readable_from` |
@@ -491,6 +563,9 @@ docker compose logs -f
 | `REPLICATION_BATCH` | `500` | 单页增量记录上限 |
 | `COMMIT_TIMEOUT_MS` | `3000` | 写入等待多数派提交的默认超时（可被请求体 `timeout_ms` 覆盖，50..120000） |
 | `READ_BARRIER_TIMEOUT_MS` | `3000` | 线性一致读屏障的默认等待超时 |
+| `SCHEDULER_ENABLED` | `true` | 到期预约领取后台线程（仅当前可写主实际领取） |
+| `SCHEDULER_INTERVAL_MS` | `200` | 调度轮询间隔 |
+| `CATCHUP_BATCH_LIMIT` | `100` | 单轮到期/补跑处理上限（超出留下一轮，不阻塞即时写入） |
 
 > 压缩期间持有元数据锁，会短暂阻塞追加（默认小段配置下为毫秒~亚秒级）。
 > 主备部署使用**各自独立的数据卷**；压缩互斥的 `flock` 针对同一数据目录，
@@ -539,8 +614,23 @@ HTTP 端到端（含 janitor 在钉位保护下不误删、释放后自动压缩
 * 线性一致读：多数派读屏障成功、失去多数派/任期变化/授权过期被拒、
   备实例返回角色/任期/已知主；读与状态默认只暴露 `<= commit_index` 的内容
 
-`CRASH_HOOK={after_fold|after_write|after_verify|after_switch}`
-可让进程在压缩对应阶段 `os._exit(99)`；
+未来生效预约（`tests/test_schedules.py` 与 `tests/test_server.py` 的
+`test_schedule_*`）：
+
+* 正常到期 pending→executing→applied、整组原子可见、返回最终日志位置；
+  同请求+内容重放返回原预约、内容不同 `schedule_conflict`；坏操作不入预约
+* 同一生效时间严格按创建顺序、更早生效时间优先；后一个看到前一个完成后的状态
+* 改期版本号自增、旧版本竞争被 `version_conflict` 拒绝；携带当前版本取消成功
+  且无业务变更；取消与到期领取竞争唯一结果（取消成功 / 取消得到 already_started）
+* 执行中进程退出后重启接管：沿用原 `request_id`/`write_id` 在原位置续等，
+  不重复入链；成员不足保持 executing、保留原位置、恢复后续跑
+* 执行期间主切换：半提交组被可证前缀截断，新主沿用请求标识在新位置重做一次，
+  旧 `write_id` 纪元前滚、旧实例迟到结果无法写成成功
+* 时钟回拨不重复执行 applied；停机积压按原顺序分批补跑、受单轮上限约束、
+  不阻塞即时写入
+* HTTP 端到端：创建/幂等/改期/取消竞争/手动 tick/后台线程自动到期
+
+`CRASH_HOOK={after_fold|after_write|after_verify|after_switch}` 可让进程在压缩对应阶段 `os._exit(99)`；
 `CRASH_HOOK={batch_after_mark|batch_after_append|batch_after_register}`
 可让进程在批次提交对应阶段崩溃；
 `CRASH_HOOK={snapshot_after_verify|snapshot_after_write|snapshot_after_switch}`

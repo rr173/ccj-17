@@ -284,3 +284,90 @@ def test_batch_committed_survives_server_restart(tmp_path):
         assert len(page["records"]) == 1
         st, stb = s.call("GET", "/state")
         assert stb["state"] == {"z": 7}
+
+
+# ---------------------------------------------------------------- schedules
+
+
+def test_schedule_http_lifecycle_and_idempotency(tmp_path):
+    future = int(time.time() * 1000) + 600_000
+    with Server(tmp_path, JANITOR_ENABLED="false", SCHEDULER_ENABLED="false") as s:
+        body = {"request_id": "http-1", "effective_at": future,
+                "ops": [{"type": "put", "payload": {"key": "a", "value": 1}}]}
+        st, r = s.call("POST", "/schedules", body)
+        assert st == 201 and r["status"] == "pending" and r["version"] == 1
+        # 重复创建相同内容 -> 原预约 replay
+        st, r2 = s.call("POST", "/schedules", body)
+        assert st == 201 and r2.get("replay") is True
+        # 不同内容 -> 409
+        bad = dict(body, ops=[{"type": "put", "payload": {"key": "a", "value": 2}}])
+        st, err = s.call("POST", "/schedules", bad)
+        assert st == 409 and err["error"] == "schedule_conflict"
+        # 改期：旧版本被拒，新版本成功
+        st, err = s.call("POST", "/schedules/http-1/reschedule",
+                         {"effective_at": future + 1000, "expected_version": 99})
+        assert st == 409 and err["error"] == "version_conflict"
+        st, rr = s.call("POST", "/schedules/http-1/reschedule",
+                        {"effective_at": future + 1000, "expected_version": 1})
+        assert rr["version"] == 2
+        # 列表过滤
+        st, lst = s.call("GET", "/schedules?status=pending")
+        assert [x["request_id"] for x in lst["schedules"]] == ["http-1"]
+
+
+def test_schedule_http_due_then_applied_with_log_position(tmp_path):
+    past = int(time.time() * 1000) - 1000
+    with Server(tmp_path, JANITOR_ENABLED="false", SCHEDULER_ENABLED="false") as s:
+        body = {"request_id": "http-due", "effective_at": past,
+                "ops": [{"type": "put", "payload": {"key": "k", "value": 1}},
+                        {"type": "delete", "payload": {"key": "k"}},
+                        {"type": "put", "payload": {"key": "m", "value": 2}}]}
+        st, r = s.call("POST", "/schedules", body)
+        assert st == 201
+        st, out = s.call("POST", "/schedules/tick", {})
+        assert out["ran"] == 1
+        st, v = s.call("GET", "/schedules/http-due")
+        assert v["status"] == "applied" and v["first_seq"] == 1 and v["last_seq"] == 3
+        st, state = s.call("GET", "/state")
+        assert state["state"] == {"m": 2}
+
+
+def test_schedule_http_cancel_competes_with_tick_unique_outcome(tmp_path):
+    past = int(time.time() * 1000) - 1000
+    with Server(tmp_path, JANITOR_ENABLED="false", SCHEDULER_ENABLED="false") as s:
+        body = {"request_id": "http-cancel", "effective_at": past,
+                "ops": [{"type": "put", "payload": {"key": "c", "value": 1}}]}
+        s.call("POST", "/schedules", body)
+        st, cr = s.call("POST", "/schedules/http-cancel/cancel",
+                        {"expected_version": 1})
+        assert st == 200 and cr["status"] == "cancelled"
+        st, out = s.call("POST", "/schedules/tick", {})
+        assert out["ran"] == 0
+        st, state = s.call("GET", "/state")
+        assert state["state"] == {}
+        # 执行后再取消明确返回已经开始
+        body["request_id"] = "http-cancel-2"
+        s.call("POST", "/schedules", body)
+        s.call("POST", "/schedules/tick", {})
+        st, err = s.call("POST", "/schedules/http-cancel-2/cancel",
+                         {"expected_version": 1})
+        assert st == 409 and err["error"] == "already_started"
+
+
+def test_schedule_background_scheduler_applies_due_automatically(tmp_path):
+    past = int(time.time() * 1000) + 500
+    with Server(tmp_path, JANITOR_ENABLED="false",
+                SCHEDULER_INTERVAL_MS="50", GRANT_TTL_MS="600000") as s:
+        body = {"request_id": "bg-1", "effective_at": past,
+                "ops": [{"type": "put", "payload": {"key": "bg", "value": 1}}]}
+        st, r = s.call("POST", "/schedules", body)
+        assert st == 201
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            st, v = s.call("GET", "/schedules/bg-1")
+            if v["status"] == "applied":
+                break
+            time.sleep(0.1)
+        assert v["status"] == "applied" and v["first_seq"] == 1
+        st, state = s.call("GET", "/state")
+        assert state["state"] == {"bg": 1}

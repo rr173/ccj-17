@@ -120,6 +120,7 @@ if __name__ == "__main__":
     run_module("tests.test_replication")
     run_module("tests.test_consensus")
     run_module("tests.test_server_replication")
+    run_module("tests.test_schedules")
     print()
     for label, tb in FAILURES:
         print("\n" + "=" * 70)

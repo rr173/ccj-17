@@ -31,22 +31,25 @@ class Proposal:
     first_seq: int
     last_seq: int
     term: int = 0           # 记录入链时主实例的任期；0 表示来源未知
-    kind: str = "write"     # write | batch | term_marker
+    kind: str = "write"     # write | batch | term_marker | schedule
     write_id: Optional[str] = None
     batch_id: Optional[str] = None
+    request_id: Optional[str] = None  # kind=schedule：预约请求标识
 
     def to_dict(self) -> dict:
         return {
             "first_seq": self.first_seq, "last_seq": self.last_seq,
             "term": self.term, "kind": self.kind,
             "write_id": self.write_id, "batch_id": self.batch_id,
+            "request_id": self.request_id,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "Proposal":
         return cls(first_seq=int(d["first_seq"]), last_seq=int(d["last_seq"]),
                    term=int(d.get("term", 0)), kind=d.get("kind", "write"),
-                   write_id=d.get("write_id"), batch_id=d.get("batch_id"))
+                   write_id=d.get("write_id"), batch_id=d.get("batch_id"),
+                   request_id=d.get("request_id"))
 
 
 def new_write_id() -> str:

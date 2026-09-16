@@ -62,6 +62,9 @@ def build_config() -> Config:
         replica_source=(os.environ.get("REPLICA_SOURCE", "").strip() or None),
         commit_timeout_ms=int(os.environ.get("COMMIT_TIMEOUT_MS", 3_000)),
         read_barrier_timeout_ms=int(os.environ.get("READ_BARRIER_TIMEOUT_MS", 3_000)),
+        scheduler_enabled=_env_bool("SCHEDULER_ENABLED", True),
+        scheduler_interval_ms=int(os.environ.get("SCHEDULER_INTERVAL_MS", 200)),
+        catchup_batch_limit=int(os.environ.get("CATCHUP_BATCH_LIMIT", 100)),
     )
 
 
@@ -188,6 +191,27 @@ class Handler(BaseHTTPRequestHandler):
                     wait_commit=bool(b.get("wait", True))))
             if len(parts) == 3 and parts[0] == "batches" and parts[2] == "abort" and method == "POST":
                 return self._send(200, self.kernel.abort_batch(parts[1]))
+            # ---------- 未来生效变更预约 ----------
+            if route == ("schedules", 1, "POST"):
+                b = self._body()
+                return self._send(201, self.kernel.create_schedule(
+                    b.get("request_id"), b.get("effective_at"), b.get("ops"),
+                    expected_version=b.get("expected_version")))
+            if route == ("schedules", 1, "GET"):
+                status = self._qs().get("status", [None])[0]
+                return self._send(200, self.kernel.list_schedules(status))
+            if len(parts) == 2 and parts[0] == "schedules" and parts[1] == "tick" and method == "POST":
+                return self._send(200, self.kernel.scheduler_tick())
+            if len(parts) == 2 and parts[0] == "schedules" and method == "GET":
+                return self._send(200, self.kernel.get_schedule(parts[1]))
+            if len(parts) == 3 and parts[0] == "schedules" and parts[2] == "cancel" and method == "POST":
+                b = self._body()
+                return self._send(200, self.kernel.cancel_schedule(
+                    parts[1], b.get("expected_version")))
+            if len(parts) == 3 and parts[0] == "schedules" and parts[2] == "reschedule" and method == "POST":
+                b = self._body()
+                return self._send(200, self.kernel.reschedule(
+                    parts[1], b.get("effective_at"), b.get("expected_version")))
             if route == ("read", 1, "GET"):
                 start = self._qs_int("from", 1, minimum=1)
                 limit = min(self._qs_int("limit", 100, minimum=1), 1000)
@@ -312,6 +336,12 @@ _ENDPOINTS = [
     "POST /batches/{id}/ops",
     "POST /batches/{id}/commit {write_id?,timeout_ms?,wait?}",
     "POST /batches/{id}/abort",
+    "POST /schedules {request_id,effective_at,ops:[put|delete]}",
+    "GET /schedules[?status=pending|executing|applied|cancelled|superseded]",
+    "GET /schedules/{request_id}",
+    "POST /schedules/{request_id}/reschedule {effective_at,expected_version}",
+    "POST /schedules/{request_id}/cancel {expected_version}",
+    "POST /schedules/tick",
     "GET /readers", "POST /readers[/{id}]", "POST /readers/{id}/heartbeat", "DELETE /readers/{id}",
     "GET /pins", "GET /state?consistency=linearizable", "GET /head",
     "POST /compact", "GET /compact/result", "POST /compact/verify",
@@ -344,7 +374,8 @@ def main() -> None:
     # 故障切换是运行时事件，监督线程按当前角色启停对应子循环，无需重启进程。
     supervisor = ClusterSupervisor(
         kernel, cfg.replication_interval_ms,
-        cfg.lease_interval_ms, cfg.grant_ttl_ms)
+        cfg.lease_interval_ms, cfg.grant_ttl_ms,
+        scheduler_enabled=cfg.scheduler_enabled)
     supervisor.start()
     bg.append(supervisor)
     print(f"append-only log listening on {host}:{port}; "
